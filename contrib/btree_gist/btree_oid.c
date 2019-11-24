@@ -7,6 +7,7 @@
 #include "btree_utils_num.h"
 #include "utils/rel.h"
 #include "utils/sortsupport.h"
+#include "utils/builtins.h"
 
 typedef struct
 {
@@ -101,15 +102,7 @@ PG_FUNCTION_INFO_V1(oid_dist);
 Datum
 oid_dist(PG_FUNCTION_ARGS)
 {
-	Oid			a = PG_GETARG_OID(0);
-	Oid			b = PG_GETARG_OID(1);
-	Oid			res;
-
-	if (a < b)
-		res = b - a;
-	else
-		res = a - b;
-	PG_RETURN_OID(res);
+	return oiddist(fcinfo);
 }
 
 
