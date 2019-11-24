@@ -8,6 +8,7 @@
 #include "utils/float.h"
 #include "utils/rel.h"
 #include "utils/sortsupport.h"
+#include "utils/builtins.h"
 
 typedef struct float8key
 {
@@ -114,23 +115,7 @@ PG_FUNCTION_INFO_V1(float8_dist);
 Datum
 float8_dist(PG_FUNCTION_ARGS)
 {
-	float8		a = PG_GETARG_FLOAT8(0);
-	float8		b = PG_GETARG_FLOAT8(1);
-	float8		r;
-
-	r = a - b;
-	if (unlikely(isinf(r)) && !isinf(a) && !isinf(b))
-		float_overflow_error();
-	if (unlikely(isnan(r)))
-	{
-		if (isnan(a) && isnan(b))
-			r = 0.0;			/* treat NaNs as equal */
-		else if (isnan(a) || isnan(b))
-			r = get_float8_infinity();	/* max dist for NaN vs non-NaN */
-		else
-			r = 0.0;			/* must be Inf - Inf case */
-	}
-	PG_RETURN_FLOAT8(fabs(r));
+	return float8dist(fcinfo);
 }
 
 

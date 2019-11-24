@@ -2243,11 +2243,11 @@ _bt_endpoint(IndexScanDesc scan, ScanDirection dir)
 		if (IsolationIsSerializable())
 		{
 			PredicateLockRelation(rel, scan->xs_snapshot);
-			so->currPos.buf = _bt_get_endpoint(rel, 0,
+			currPos->buf = _bt_get_endpoint(rel, 0,
 											   ScanDirectionIsBackward(dir));
 		}
 
-		if (!BufferIsValid(so->currPos.buf))
+		if (!BufferIsValid(currPos->buf))
 		{
 			_bt_parallel_done(scan);
 			return false;
