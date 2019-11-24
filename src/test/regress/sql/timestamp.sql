@@ -430,3 +430,11 @@ select age(timestamp '-infinity', timestamp '-infinity');
 -- test timestamp near POSTGRES_EPOCH_JDATE
 select timestamp '1999-12-31 24:00:00';
 select make_timestamp(1999, 12, 31, 24, 0, 0);
+
+-- distance operators
+SELECT d1 <-> date '2001-02-03' AS "Distance" FROM TIMESTAMP_TBL;
+SELECT d1 <-> date '2001-02-03' AS "Distance" FROM TIMESTAMP_TBL WHERE isfinite(d1);
+SELECT d1 <-> timestamp '2001-02-03 01:23:45' AS "Distance" FROM TIMESTAMP_TBL;
+SELECT d1 <-> timestamp '2001-02-03 01:23:45' AS "Distance" FROM TIMESTAMP_TBL WHERE isfinite(d1);
+SELECT d1 <-> timestamptz '2001-02-03 01:23:45+03' AS "Distance" FROM TIMESTAMP_TBL;
+SELECT d1 <-> timestamptz '2001-02-03 01:23:45+03' AS "Distance" FROM TIMESTAMP_TBL WHERE isfinite(d1);
