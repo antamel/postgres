@@ -360,7 +360,16 @@ SlabContextCreate(MemoryContext parent,
 		elog(ERROR, "block size %zu for slab is too small for %zu-byte chunks",
 			 blockSize, chunkSize);
 
-
+	/* Do not exceed maximum allowed memory allocation */
+	if (exceeds_max_total_bkend_mem(Slab_CONTEXT_HDRSZ(chunksPerBlock)))
+	{
+		MemoryContextStats(TopMemoryContext);
+		ereport(ERROR,
+				(errcode(ERRCODE_OUT_OF_MEMORY),
+				 errmsg("out of memory - exceeds max_total_backend_memory"),
+				 errdetail("Failed while creating memory context \"%s\".",
+						   name)));
+	}
 
 	slab = (SlabContext *) malloc(Slab_CONTEXT_HDRSZ(chunksPerBlock));
 	if (slab == NULL)
@@ -582,6 +591,10 @@ SlabAllocFromNewBlock(MemoryContext context, Size size, int flags)
 	}
 	else
 	{
+		/* Do not exceed maximum allowed memory allocation */
+		if (exceeds_max_total_bkend_mem(slab->blockSize))
+			return MemoryContextAllocationFailure(context, size, flags);
+
 		block = (SlabBlock *) malloc(slab->blockSize);
 
 		if (unlikely(block == NULL))
