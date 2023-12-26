@@ -10,6 +10,7 @@
 #ifndef BACKEND_STATUS_H
 #define BACKEND_STATUS_H
 
+#include "common/int.h"
 #include "datatype/timestamp.h"
 #include "libpq/pqcomm.h"
 #include "miscadmin.h"			/* for BackendType */
@@ -32,6 +33,14 @@ typedef enum BackendState
 	STATE_DISABLED,
 } BackendState;
 
+/* Enum helper for reporting memory allocator type */
+enum pg_allocator_type
+{
+	PG_ALLOC_ASET = 1,
+	PG_ALLOC_DSM,
+	PG_ALLOC_GENERATION,
+	PG_ALLOC_SLAB
+};
 
 /* ----------
  * Shared-memory data structures
@@ -170,6 +179,15 @@ typedef struct PgBackendStatus
 
 	/* query identifier, optionally computed using post_parse_analyze_hook */
 	uint64		st_query_id;
+
+	/* Current memory allocated to this backend */
+	uint64		allocated_bytes;
+
+	/* Current memory allocated to this backend by type */
+	uint64		aset_allocated_bytes;
+	uint64		dsm_allocated_bytes;
+	uint64		generation_allocated_bytes;
+	uint64		slab_allocated_bytes;
 } PgBackendStatus;
 
 
@@ -294,6 +312,11 @@ extern PGDLLIMPORT int pgstat_track_activity_query_size;
  * ----------
  */
 extern PGDLLIMPORT PgBackendStatus *MyBEEntry;
+extern PGDLLIMPORT uint64 *my_allocated_bytes;
+extern PGDLLIMPORT uint64 *my_aset_allocated_bytes;
+extern PGDLLIMPORT uint64 *my_dsm_allocated_bytes;
+extern PGDLLIMPORT uint64 *my_generation_allocated_bytes;
+extern PGDLLIMPORT uint64 *my_slab_allocated_bytes;
 
 
 /* ----------
@@ -325,7 +348,12 @@ extern const char *pgstat_get_backend_current_activity(int pid, bool checkUser);
 extern const char *pgstat_get_crashed_backend_activity(int pid, char *buffer,
 													   int buflen);
 extern uint64 pgstat_get_my_query_id(void);
-
+extern void pgstat_set_allocated_bytes_storage(uint64 *allocated_bytes,
+											   uint64 *aset_allocated_bytes,
+											   uint64 *dsm_allocated_bytes,
+											   uint64 *generation_allocated_bytes,
+											   uint64 *slab_allocated_bytes);
+extern void pgstat_reset_allocated_bytes_storage(void);
 
 /* ----------
  * Support functions for the SQL-callable functions to
@@ -338,5 +366,119 @@ extern LocalPgBackendStatus *pgstat_get_local_beentry_by_backend_id(BackendId be
 extern LocalPgBackendStatus *pgstat_get_local_beentry_by_index(int idx);
 extern char *pgstat_clip_activity(const char *raw_activity);
 
+/* ----------
+ * pgstat_report_allocated_bytes_decrease() -
+ *  Called to report decrease in memory allocated for this backend.
+ *
+ * my_{*_}allocated_bytes initially points to local memory, making it safe to
+ * call this before pgstats has been initialized.
+ * ----------
+ */
+static inline void
+pgstat_report_allocated_bytes_decrease(int64 proc_allocated_bytes,
+									   int pg_allocator_type)
+{
+	uint64		temp;
+
+	/* Avoid allocated_bytes unsigned integer overflow on decrease */
+	if (pg_sub_u64_overflow(*my_allocated_bytes, proc_allocated_bytes, &temp))
+	{
+		/* On overflow, set allocated bytes and allocator type bytes to zero */
+		*my_allocated_bytes = 0;
+		*my_aset_allocated_bytes = 0;
+		*my_dsm_allocated_bytes = 0;
+		*my_generation_allocated_bytes = 0;
+		*my_slab_allocated_bytes = 0;
+	}
+	else
+	{
+		/* decrease allocation */
+		*my_allocated_bytes -= proc_allocated_bytes;
+
+		/* Decrease allocator type allocated bytes. */
+		switch (pg_allocator_type)
+		{
+			case PG_ALLOC_ASET:
+				*my_aset_allocated_bytes -= proc_allocated_bytes;
+				break;
+			case PG_ALLOC_DSM:
+
+				/*
+				 * Some dsm allocations live beyond process exit. These are
+				 * accounted for in a global counter in
+				 * pgstat_reset_allocated_bytes_storage at process exit.
+				 */
+				*my_dsm_allocated_bytes -= proc_allocated_bytes;
+				break;
+			case PG_ALLOC_GENERATION:
+				*my_generation_allocated_bytes -= proc_allocated_bytes;
+				break;
+			case PG_ALLOC_SLAB:
+				*my_slab_allocated_bytes -= proc_allocated_bytes;
+				break;
+		}
+	}
+
+	return;
+}
+
+/* ----------
+ * pgstat_report_allocated_bytes_increase() -
+ *  Called to report increase in memory allocated for this backend.
+ *
+ * my_allocated_bytes initially points to local memory, making it safe to call
+ * this before pgstats has been initialized.
+ * ----------
+ */
+static inline void
+pgstat_report_allocated_bytes_increase(int64 proc_allocated_bytes,
+									   int pg_allocator_type)
+{
+	*my_allocated_bytes += proc_allocated_bytes;
+
+	/* Increase allocator type allocated bytes */
+	switch (pg_allocator_type)
+	{
+		case PG_ALLOC_ASET:
+			*my_aset_allocated_bytes += proc_allocated_bytes;
+			break;
+		case PG_ALLOC_DSM:
+
+			/*
+			 * Some dsm allocations live beyond process exit. These are
+			 * accounted for in a global counter in
+			 * pgstat_reset_allocated_bytes_storage at process exit.
+			 */
+			*my_dsm_allocated_bytes += proc_allocated_bytes;
+			break;
+		case PG_ALLOC_GENERATION:
+			*my_generation_allocated_bytes += proc_allocated_bytes;
+			break;
+		case PG_ALLOC_SLAB:
+			*my_slab_allocated_bytes += proc_allocated_bytes;
+			break;
+	}
+
+	return;
+}
+
+/* ---------
+ * pgstat_init_allocated_bytes() -
+ *
+ * Called to initialize allocated bytes variables after fork and to
+ * avoid double counting allocations.
+ * ---------
+ */
+static inline void
+pgstat_init_allocated_bytes(void)
+{
+	*my_allocated_bytes = 0;
+	*my_aset_allocated_bytes = 0;
+	*my_dsm_allocated_bytes = 0;
+	*my_generation_allocated_bytes = 0;
+	*my_slab_allocated_bytes = 0;
+
+	return;
+}
 
 #endif							/* BACKEND_STATUS_H */
