@@ -2095,7 +2095,7 @@ pg_stat_get_memory_allocation(PG_FUNCTION_ARGS)
 Datum
 pg_stat_get_global_memory_allocation(PG_FUNCTION_ARGS)
 {
-#define PG_STAT_GET_GLOBAL_MEMORY_ALLOCATION_COLS	2
+#define PG_STAT_GET_GLOBAL_MEMORY_ALLOCATION_COLS	3
 	TupleDesc	tupdesc;
 	Datum		values[PG_STAT_GET_GLOBAL_MEMORY_ALLOCATION_COLS] = {0};
 	bool		nulls[PG_STAT_GET_GLOBAL_MEMORY_ALLOCATION_COLS] = {0};
@@ -2105,15 +2105,23 @@ pg_stat_get_global_memory_allocation(PG_FUNCTION_ARGS)
 	tupdesc = CreateTemplateTupleDesc(PG_STAT_GET_GLOBAL_MEMORY_ALLOCATION_COLS);
 	TupleDescInitEntry(tupdesc, (AttrNumber) 1, "datid",
 					   OIDOID, -1, 0);
-	TupleDescInitEntry(tupdesc, (AttrNumber) 2, "global_dsm_allocated_bytes",
+	TupleDescInitEntry(tupdesc, (AttrNumber) 2, "total_bkend_mem_bytes_available",
+					   INT8OID, -1, 0);
+	TupleDescInitEntry(tupdesc, (AttrNumber) 3, "global_dsm_allocated_bytes",
 					   INT8OID, -1, 0);
 	BlessTupleDesc(tupdesc);
 
 	/* datid */
 	values[0] = ObjectIdGetDatum(MyDatabaseId);
 
-	/* get global_dsm_allocated_bytes */
-	values[1] = Int64GetDatum(pg_atomic_read_u64(&procglobal->global_dsm_allocation));
+	/* Get total_bkend_mem_bytes - return -1 if disabled */
+	if (max_total_bkend_mem == 0)
+		values[1] = Int64GetDatum(-1);
+	else
+		values[1] = Int64GetDatum(pg_atomic_read_u64(&procglobal->total_bkend_mem_bytes));
+
+	/* Get global_dsm_allocated_bytes */
+	values[2] = Int64GetDatum(pg_atomic_read_u64(&procglobal->global_dsm_allocation));
 
 	/* Returns the record as Datum */
 	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));

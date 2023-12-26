@@ -200,6 +200,16 @@ GenerationContextCreate(MemoryContext parent,
 	else
 		allocSize = Max(allocSize, initBlockSize);
 
+	if (exceeds_max_total_bkend_mem(allocSize))
+	{
+		MemoryContextStats(TopMemoryContext);
+		ereport(ERROR,
+				(errcode(ERRCODE_OUT_OF_MEMORY),
+				 errmsg("out of memory - exceeds max_total_backend_memory"),
+				 errdetail("Failed while creating memory context \"%s\".",
+						   name)));
+	}
+
 	/*
 	 * Allocate the initial block.  Unlike other generation.c blocks, it
 	 * starts with the context header and its block header follows that.
@@ -376,6 +386,9 @@ GenerationAlloc(MemoryContext context, Size size)
 	{
 		Size		blksize = required_size + Generation_BLOCKHDRSZ;
 
+		if (exceeds_max_total_bkend_mem(blksize))
+			return NULL;
+
 		block = (GenerationBlock *) malloc(blksize);
 		if (block == NULL)
 			return NULL;
@@ -478,6 +491,9 @@ GenerationAlloc(MemoryContext context, Size size)
 			/* round the size up to the next power of 2 */
 			if (blksize < required_size)
 				blksize = pg_nextpower2_size_t(required_size);
+
+			if (exceeds_max_total_bkend_mem(blksize))
+				return NULL;
 
 			block = (GenerationBlock *) malloc(blksize);
 

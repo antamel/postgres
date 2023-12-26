@@ -254,6 +254,16 @@ dsm_impl_posix(dsm_op op, dsm_handle handle, Size request_size,
 		return true;
 	}
 
+	/* Do not exceed maximum allowed memory allocation */
+	if (op == DSM_OP_CREATE && exceeds_max_total_bkend_mem(request_size))
+	{
+		ereport(elevel,
+				(errcode_for_dynamic_shared_memory(),
+				 errmsg("out of memory for segment \"%s\" - exceeds max_total_backend_memory: %m",
+						name)));
+		return false;
+	}
+
 	/*
 	 * Create new segment or open an existing one for attach.
 	 *
@@ -523,6 +533,10 @@ dsm_impl_sysv(dsm_op op, dsm_handle handle, Size request_size,
 		int			flags = IPCProtection;
 		size_t		segsize;
 
+		/* Do not exceed maximum allowed memory allocation */
+		if (op == DSM_OP_CREATE && exceeds_max_total_bkend_mem(request_size))
+			return false;
+
 		/*
 		 * Allocate the memory BEFORE acquiring the resource, so that we don't
 		 * leak the resource if memory allocation fails.
@@ -716,6 +730,10 @@ dsm_impl_windows(dsm_op op, dsm_handle handle, Size request_size,
 		*mapped_size = 0;
 		return true;
 	}
+
+	/* Do not exceed maximum allowed memory allocation */
+	if (op == DSM_OP_CREATE && exceeds_max_total_bkend_mem(request_size))
+		return false;
 
 	/* Create new segment or open an existing one for attach. */
 	if (op == DSM_OP_CREATE)

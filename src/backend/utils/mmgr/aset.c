@@ -438,6 +438,18 @@ AllocSetContextCreateInternal(MemoryContext parent,
 	else
 		firstBlockSize = Max(firstBlockSize, initBlockSize);
 
+	/* Do not exceed maximum allowed memory allocation */
+	if (exceeds_max_total_bkend_mem(firstBlockSize))
+	{
+		if (TopMemoryContext)
+			MemoryContextStats(TopMemoryContext);
+		ereport(ERROR,
+				(errcode(ERRCODE_OUT_OF_MEMORY),
+				 errmsg("out of memory - exceeds max_total_backend_memory"),
+				 errdetail("Failed while creating memory context \"%s\".",
+						   name)));
+	}
+
 	/*
 	 * Allocate the initial block.  Unlike other aset.c blocks, it starts with
 	 * the context header and its block header follows that.
@@ -737,6 +749,11 @@ AllocSetAlloc(MemoryContext context, Size size)
 #endif
 
 		blksize = chunk_size + ALLOC_BLOCKHDRSZ + ALLOC_CHUNKHDRSZ;
+
+		/* Do not exceed maximum allowed memory allocation */
+		if (exceeds_max_total_bkend_mem(blksize))
+			return NULL;
+
 		block = (AllocBlock) malloc(blksize);
 		if (block == NULL)
 			return NULL;
@@ -936,6 +953,10 @@ AllocSetAlloc(MemoryContext context, Size size)
 		required_size = chunk_size + ALLOC_BLOCKHDRSZ + ALLOC_CHUNKHDRSZ;
 		while (blksize < required_size)
 			blksize <<= 1;
+
+		/* Do not exceed maximum allowed memory allocation */
+		if (exceeds_max_total_bkend_mem(blksize))
+			return NULL;
 
 		/* Try to allocate it */
 		block = (AllocBlock) malloc(blksize);
@@ -1174,6 +1195,18 @@ AllocSetRealloc(void *pointer, Size size)
 		/* Do the realloc */
 		blksize = chksize + ALLOC_BLOCKHDRSZ + ALLOC_CHUNKHDRSZ;
 		oldblksize = block->endptr - ((char *) block);
+
+		/*
+		 * Do not exceed maximum allowed memory allocation. NOTE: checking for
+		 * the full size here rather than just the amount of increased
+		 * allocation to prevent a potential underflow of *my_allocation
+		 * allowance in cases where blksize - oldblksize does not trigger a
+		 * refill but blksize is greater than *my_allocation_allowance.
+		 * Underflow would occur with the call below to
+		 * pgstat_report_allocated_bytes_increase()
+		 */
+		if (blksize > oldblksize && exceeds_max_total_bkend_mem(blksize))
+			return NULL;
 
 		block = (AllocBlock) realloc(block, blksize);
 		if (block == NULL)
