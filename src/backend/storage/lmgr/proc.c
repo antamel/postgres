@@ -180,6 +180,7 @@ InitProcGlobal(void)
 	ProcGlobal->checkpointerLatch = NULL;
 	pg_atomic_init_u32(&ProcGlobal->procArrayGroupFirst, INVALID_PROC_NUMBER);
 	pg_atomic_init_u32(&ProcGlobal->clogGroupFirst, INVALID_PROC_NUMBER);
+	pg_atomic_init_u64(&ProcGlobal->global_dsm_allocation, 0);
 
 	/*
 	 * Create and initialize all the PGPROC structures we'll need.  There are
