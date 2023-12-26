@@ -2059,7 +2059,7 @@ pg_stat_get_memory_allocation(PG_FUNCTION_ARGS)
 		PgBackendStatus *beentry;
 
 		/* Get the next one in the list */
-		local_beentry = pgstat_fetch_stat_local_beentry(curr_backend);
+		local_beentry = pgstat_get_local_beentry_by_index(curr_backend);
 		beentry = &local_beentry->backendStatus;
 
 		/* If looking for specific PID, ignore all the others */
