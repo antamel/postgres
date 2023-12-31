@@ -124,6 +124,7 @@ bthandler(PG_FUNCTION_ARGS)
 	amroutine->amcanhash = false;
 	amroutine->amconsistentequality = true;
 	amroutine->amconsistentordering = true;
+	amroutine->amorderbyopfirstcol = false;
 	amroutine->amcanbackward = true;
 	amroutine->amcanunique = true;
 	amroutine->amcanmulticol = true;

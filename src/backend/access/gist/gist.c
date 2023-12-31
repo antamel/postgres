@@ -68,6 +68,7 @@ gisthandler(PG_FUNCTION_ARGS)
 	amroutine->amcanhash = false;
 	amroutine->amconsistentequality = false;
 	amroutine->amconsistentordering = false;
+	amroutine->amorderbyopfirstcol = false;
 	amroutine->amcanbackward = false;
 	amroutine->amcanunique = false;
 	amroutine->amcanmulticol = true;

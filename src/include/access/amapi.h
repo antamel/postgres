@@ -250,6 +250,11 @@ typedef struct IndexAmRoutine
 	bool		amconsistentequality;
 	/* do operators within an opfamily have consistent ordering semantics? */
 	bool		amconsistentordering;
+	/*
+	 * Does AM support only the one ORDER BY operator on first indexed column?
+	 * amcanorderbyop is implied.
+	 */
+	bool		amorderbyopfirstcol;
 	/* does AM support backward scanning? */
 	bool		amcanbackward;
 	/* does AM support UNIQUE indexes? */
