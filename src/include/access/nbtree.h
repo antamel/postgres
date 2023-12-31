@@ -927,7 +927,8 @@ typedef BTVacuumPostingData *BTVacuumPosting;
 /*
  * BTScanOpaqueData is the btree-private state needed for an indexscan.
  * This consists of preprocessed scan keys (see _bt_preprocess_keys() for
- * details of the preprocessing), information about the current location
+ * details of the preprocessing), and tree scan state itself (BTScanStateData).
+ * In turn, BTScanStateData contains information about the current location
  * of the scan, and information about the marked location, if any.  (We use
  * BTScanPosData to represent the data needed for each of current and marked
  * locations.)	In addition we can remember some known-killed index entries
@@ -1050,23 +1051,8 @@ typedef struct BTArrayKeyInfo
 	ScanKey		high_compare;	/* array's < or <= upper bound */
 } BTArrayKeyInfo;
 
-typedef struct BTScanOpaqueData
+typedef struct BTScanStateData
 {
-	/* these fields are set by _bt_preprocess_keys(): */
-	bool		qual_ok;		/* false if qual can never be satisfied */
-	int			numberOfKeys;	/* number of preprocessed scan keys */
-	ScanKey		keyData;		/* array of preprocessed scan keys */
-
-	/* workspace for SK_SEARCHARRAY support */
-	int			numArrayKeys;	/* number of equality-type array keys */
-	bool		skipScan;		/* At least one skip array in arrayKeys[]? */
-	bool		needPrimScan;	/* New prim scan to continue in current dir? */
-	bool		scanBehind;		/* Check scan not still behind on next page? */
-	bool		oppositeDirCheck;	/* scanBehind opposite-scan-dir check? */
-	BTArrayKeyInfo *arrayKeys;	/* info about each equality-type array key */
-	FmgrInfo   *orderProcs;		/* ORDER procs for required equality keys */
-	MemoryContext arrayContext; /* scan-lifespan context for array data */
-
 	/* info about killed items if any (killedItems is NULL if never used) */
 	int		   *killedItems;	/* currPos.items indexes of killed items */
 	int			numKilled;		/* number of currently stored items */
@@ -1092,6 +1078,29 @@ typedef struct BTScanOpaqueData
 	/* keep these last in struct for efficiency */
 	BTScanPosData currPos;		/* current position data */
 	BTScanPosData markPos;		/* marked position, if any */
+} BTScanStateData;
+
+typedef BTScanStateData *BTScanState;
+
+typedef struct BTScanOpaqueData
+{
+	/* these fields are set by _bt_preprocess_keys(): */
+	bool		qual_ok;		/* false if qual can never be satisfied */
+	int			numberOfKeys;	/* number of preprocessed scan keys */
+	ScanKey		keyData;		/* array of preprocessed scan keys */
+
+	/* workspace for SK_SEARCHARRAY support */
+	int			numArrayKeys;	/* number of equality-type array keys */
+	bool		skipScan;		/* At least one skip array in arrayKeys[]? */
+	bool		needPrimScan;	/* New prim scan to continue in current dir? */
+	bool		scanBehind;		/* Check scan not still behind on next page? */
+	bool		oppositeDirCheck;	/* scanBehind opposite-scan-dir check? */
+	BTArrayKeyInfo *arrayKeys;	/* info about each equality-type array key */
+	FmgrInfo   *orderProcs;		/* ORDER procs for required equality keys */
+	MemoryContext arrayContext; /* scan-lifespan context for array data */
+
+	/* the state of tree scan */
+	BTScanStateData state;
 } BTScanOpaqueData;
 
 typedef BTScanOpaqueData *BTScanOpaque;
@@ -1271,8 +1280,9 @@ extern void _bt_preprocess_keys(IndexScanDesc scan);
 /*
  * prototypes for functions in nbtreadpage.c
  */
-extern bool _bt_readpage(IndexScanDesc scan, ScanDirection dir,
-						 OffsetNumber offnum, bool firstpage);
+extern bool _bt_readpage(IndexScanDesc scan, BTScanState state,
+						 ScanDirection dir, OffsetNumber offnum,
+						 bool firstpage);
 extern void _bt_start_array_keys(IndexScanDesc scan, ScanDirection dir);
 extern int	_bt_binsrch_array_skey(FmgrInfo *orderproc,
 								   bool cur_elem_trig, ScanDirection dir,
@@ -1295,7 +1305,7 @@ extern Buffer _bt_get_endpoint(Relation rel, uint32 level, bool rightmost);
  * prototypes for functions in nbtutils.c
  */
 extern BTScanInsert _bt_mkscankey(Relation rel, IndexTuple itup);
-extern void _bt_killitems(IndexScanDesc scan);
+extern void _bt_killitems(IndexScanDesc scan, BTScanState state);
 extern BTCycleId _bt_vacuum_cycleid(Relation rel);
 extern BTCycleId _bt_start_vacuum(Relation rel);
 extern void _bt_end_vacuum(Relation rel);
@@ -1314,6 +1324,7 @@ extern bool _bt_check_natts(Relation rel, bool heapkeyspace, Page page,
 extern void _bt_check_third_page(Relation rel, Relation heap,
 								 bool needheaptidspace, Page page, IndexTuple newtup);
 extern bool _bt_allequalimage(Relation rel, bool debugmessage);
+extern void _bt_allocate_tuple_workspaces(BTScanState state);
 
 /*
  * prototypes for functions in nbtvalidate.c
