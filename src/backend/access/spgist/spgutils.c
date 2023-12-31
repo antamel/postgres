@@ -50,6 +50,7 @@ spghandler(PG_FUNCTION_ARGS)
 	amroutine->amoptsprocnum = SPGIST_OPTIONS_PROC;
 	amroutine->amcanorder = false;
 	amroutine->amcanorderbyop = true;
+	amroutine->amorderbyopfirstcol = false;
 	amroutine->amcanhash = false;
 	amroutine->amconsistentequality = false;
 	amroutine->amconsistentordering = false;
