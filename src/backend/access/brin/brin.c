@@ -256,6 +256,7 @@ brinhandler(PG_FUNCTION_ARGS)
 		.amoptsprocnum = BRIN_PROCNUM_OPTIONS,
 		.amcanorder = false,
 		.amcanorderbyop = false,
+		.amorderbyopfirstcol = false,
 		.amcanhash = false,
 		.amconsistentequality = false,
 		.amconsistentordering = false,

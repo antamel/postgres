@@ -50,6 +50,7 @@ spghandler(PG_FUNCTION_ARGS)
 		.amoptsprocnum = SPGIST_OPTIONS_PROC,
 		.amcanorder = false,
 		.amcanorderbyop = true,
+		.amorderbyopfirstcol = false,
 		.amcanhash = false,
 		.amconsistentequality = false,
 		.amconsistentordering = false,
