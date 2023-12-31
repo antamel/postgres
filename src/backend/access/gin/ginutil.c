@@ -45,6 +45,7 @@ ginhandler(PG_FUNCTION_ARGS)
 		.amoptsprocnum = GIN_OPTIONS_PROC,
 		.amcanorder = false,
 		.amcanorderbyop = false,
+		.amorderbyopfirstcol = false,
 		.amcanhash = false,
 		.amconsistentequality = false,
 		.amconsistentordering = false,
