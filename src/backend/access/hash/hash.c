@@ -76,6 +76,7 @@ hashhandler(PG_FUNCTION_ARGS)
 		.amoptsprocnum = HASHOPTIONS_PROC,
 		.amcanorder = false,
 		.amcanorderbyop = false,
+		.amorderbyopfirstcol = false,
 		.amcanhash = true,
 		.amconsistentequality = true,
 		.amconsistentordering = false,
