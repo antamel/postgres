@@ -124,6 +124,7 @@ bthandler(PG_FUNCTION_ARGS)
 		.amoptsprocnum = BTOPTIONS_PROC,
 		.amcanorder = true,
 		.amcanorderbyop = false,
+		.amorderbyopfirstcol = false,
 		.amcanhash = false,
 		.amconsistentequality = true,
 		.amconsistentordering = true,
