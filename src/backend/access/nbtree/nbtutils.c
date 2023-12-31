@@ -181,83 +181,83 @@ _bt_compare_int(const void *va, const void *vb)
  * called if so->numKilled > 0).
  *
  * Caller should not have a lock on the so->currPos page, but must hold a
- * buffer pin when !so->dropPin.  When we return, it still won't be locked.
+ * buffer pin when !state->dropPin.  When we return, it still won't be locked.
  * It'll continue to hold whatever pins were held before calling here.
  *
  * We match items by heap TID before assuming they are the right ones to set
  * LP_DEAD.  If the scan is one that holds a buffer pin on the target page
  * continuously from initially reading the items until applying this function
- * (if it is a !so->dropPin scan), VACUUM cannot have deleted any items on the
+ * (if it is a !state->dropPin scan), VACUUM cannot have deleted any items on the
  * page, so the page's TIDs can't have been recycled by now.  There's no risk
  * that we'll confuse a new index tuple that happens to use a recycled TID
  * with a now-removed tuple with the same TID (that used to be on this same
  * page).  We can't rely on that during scans that drop buffer pins eagerly
- * (so->dropPin scans), though, so we must condition setting LP_DEAD bits on
+ * (state->dropPin scans), though, so we must condition setting LP_DEAD bits on
  * the page LSN having not changed since back when _bt_readpage saw the page.
  * We totally give up on setting LP_DEAD bits when the page LSN changed.
  *
- * We give up much less often during !so->dropPin scans, but it still happens.
+ * We give up much less often during !state->dropPin scans, but it still happens.
  * We cope with cases where items have moved right due to insertions.  If an
  * item has moved off the current page due to a split, we'll fail to find it
  * and just give up on it.
  */
 void
-_bt_killitems(IndexScanDesc scan)
+_bt_killitems(IndexScanDesc scan, BTScanState state)
 {
 	Relation	rel = scan->indexRelation;
-	BTScanOpaque so = (BTScanOpaque) scan->opaque;
+	BTScanPos	pos = &state->currPos;
 	Page		page;
 	BTPageOpaque opaque;
 	OffsetNumber minoff;
 	OffsetNumber maxoff;
-	int			numKilled = so->numKilled;
+	int			numKilled = state->numKilled;
 	bool		killedsomething = false;
 	Buffer		buf;
 
 	Assert(numKilled > 0);
-	Assert(BTScanPosIsValid(so->currPos));
+	Assert(BTScanPosIsValid(state->currPos));
 	Assert(scan->heapRelation != NULL); /* can't be a bitmap index scan */
 
-	/* Always invalidate so->killedItems[] before leaving so->currPos */
-	so->numKilled = 0;
+	/* Always invalidate state->killedItems[] before leaving so->currPos */
+	state->numKilled = 0;
 
 	/*
-	 * We need to iterate through so->killedItems[] in leaf page order; the
+	 * We need to iterate through state->killedItems[] in leaf page order; the
 	 * loop below expects this (when marking posting list tuples, at least).
-	 * so->killedItems[] is now in whatever order the scan returned items in.
+	 * state->killedItems[] is now in whatever order the scan returned items in.
 	 * Scrollable cursor scans might have even saved the same item/TID twice.
 	 *
-	 * Sort and unique-ify so->killedItems[] to deal with all this.
+	 * Sort and unique-ify state->killedItems[] to deal with all this.
 	 */
 	if (numKilled > 1)
 	{
-		qsort(so->killedItems, numKilled, sizeof(int), _bt_compare_int);
-		numKilled = qunique(so->killedItems, numKilled, sizeof(int),
+		qsort(state->killedItems, numKilled, sizeof(int), _bt_compare_int);
+		numKilled = qunique(state->killedItems, numKilled, sizeof(int),
 							_bt_compare_int);
 	}
 
-	if (!so->dropPin)
+	if (!state->dropPin)
 	{
 		/*
 		 * We have held the pin on this page since we read the index tuples,
 		 * so all we need to do is lock it.  The pin will have prevented
 		 * concurrent VACUUMs from recycling any of the TIDs on the page.
 		 */
-		Assert(BTScanPosIsPinned(so->currPos));
-		buf = so->currPos.buf;
+		Assert(BTScanPosIsPinned(*pos));
+		buf = pos->buf;
 		_bt_lockbuf(rel, buf, BT_READ);
 	}
 	else
 	{
 		XLogRecPtr	latestlsn;
 
-		Assert(!BTScanPosIsPinned(so->currPos));
+		Assert(!BTScanPosIsPinned(*pos));
 		Assert(RelationNeedsWAL(rel));
-		buf = _bt_getbuf(rel, so->currPos.currPage, BT_READ);
+		buf = _bt_getbuf(rel, pos->currPage, BT_READ);
 
 		latestlsn = BufferGetLSNAtomic(buf);
-		Assert(so->currPos.lsn <= latestlsn);
-		if (so->currPos.lsn != latestlsn)
+		Assert(pos->lsn <= latestlsn);
+		if (pos->lsn != latestlsn)
 		{
 			/* Modified, give up on hinting */
 			_bt_relbuf(rel, buf);
@@ -275,14 +275,14 @@ _bt_killitems(IndexScanDesc scan)
 	/* Iterate through so->killedItems[] in leaf page order */
 	for (int i = 0; i < numKilled; i++)
 	{
-		int			itemIndex = so->killedItems[i];
-		BTScanPosItem *kitem = &so->currPos.items[itemIndex];
+		int			itemIndex = state->killedItems[i];
+		BTScanPosItem *kitem = &pos->items[itemIndex];
 		OffsetNumber offnum = kitem->indexOffset;
 
-		Assert(itemIndex >= so->currPos.firstItem &&
-			   itemIndex <= so->currPos.lastItem);
+		Assert(itemIndex >= pos->firstItem &&
+			   itemIndex <= pos->lastItem);
 		Assert(i == 0 ||
-			   offnum >= so->currPos.items[so->killedItems[i - 1]].indexOffset);
+			   offnum >= pos->items[state->killedItems[i - 1]].indexOffset);
 
 		if (offnum < minoff)
 			continue;			/* pure paranoia */
@@ -300,7 +300,7 @@ _bt_killitems(IndexScanDesc scan)
 
 				/*
 				 * Note that the page may have been modified in almost any way
-				 * since we first read it (in the !so->dropPin case), so it's
+				 * since we first read it (in the !state->dropPin case), so it's
 				 * possible that this posting list tuple wasn't a posting list
 				 * tuple when we first encountered its heap TIDs.
 				 */
@@ -316,7 +316,7 @@ _bt_killitems(IndexScanDesc scan)
 					 * though only in the common case where the page can't
 					 * have been concurrently modified
 					 */
-					Assert(kitem->indexOffset == offnum || !so->dropPin);
+					Assert(kitem->indexOffset == offnum || !state->dropPin);
 
 					/*
 					 * Read-ahead to later kitems here.
@@ -333,7 +333,7 @@ _bt_killitems(IndexScanDesc scan)
 					 * correctly -- posting tuple still gets killed).
 					 */
 					if (pi < numKilled)
-						kitem = &so->currPos.items[so->killedItems[pi++]];
+						kitem = &state->currPos.items[state->killedItems[pi++]];
 				}
 
 				/*
@@ -383,7 +383,7 @@ _bt_killitems(IndexScanDesc scan)
 		MarkBufferDirtyHint(buf, true);
 	}
 
-	if (!so->dropPin)
+	if (!state->dropPin)
 		_bt_unlockbuf(rel, buf);
 	else
 		_bt_relbuf(rel, buf);
@@ -1221,4 +1221,15 @@ _bt_allequalimage(Relation rel, bool debugmessage)
 	}
 
 	return allequalimage;
+}
+
+/*
+ * _bt_allocate_tuple_workspaces() -- Allocate buffers for saving index tuples
+ * 		in index-only scans.
+ */
+void
+_bt_allocate_tuple_workspaces(BTScanState state)
+{
+	state->currTuples = (char *) palloc(BLCKSZ * 2);
+	state->markTuples = state->currTuples + BLCKSZ;
 }
