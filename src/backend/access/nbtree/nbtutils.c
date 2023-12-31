@@ -1391,8 +1391,9 @@ _bt_advance_array_keys(IndexScanDesc scan, BTReadPageState *pstate,
 					   int sktrig, bool sktrig_required)
 {
 	BTScanOpaque so = (BTScanOpaque) scan->opaque;
+	BTScanPos	currPos = &so->state.currPos;
 	Relation	rel = scan->indexRelation;
-	ScanDirection dir = so->currPos.dir;
+	ScanDirection dir = currPos->dir;
 	int			arrayidx = 0;
 	bool		beyond_end_advance = false,
 				skip_array_advanced = false,
@@ -2035,7 +2036,7 @@ new_prim_scan:
 	so->needPrimScan = true;	/* ...but call _bt_first again */
 
 	if (scan->parallel_scan)
-		_bt_parallel_primscan_schedule(scan, so->currPos.currPage);
+		_bt_parallel_primscan_schedule(scan, currPos->currPage);
 
 	/* Caller's tuple doesn't match the new qual */
 	return false;
@@ -2143,18 +2144,22 @@ _bt_verify_keys_with_arraykeys(IndexScanDesc scan)
  * tupnatts: number of attributes in tupnatts (high key may be truncated)
  */
 bool
-_bt_checkkeys(IndexScanDesc scan, BTReadPageState *pstate, bool arrayKeys,
-			  IndexTuple tuple, int tupnatts)
+_bt_checkkeys(IndexScanDesc scan, BTScanState state, BTReadPageState *pstate,
+			  bool arrayKeys, IndexTuple tuple, int tupnatts)
 {
 	TupleDesc	tupdesc = RelationGetDescr(scan->indexRelation);
-	BTScanOpaque so = (BTScanOpaque) scan->opaque;
-	ScanDirection dir = so->currPos.dir;
+
+	BTScanPos	currPos = &state->currPos;
+	ScanDirection dir = currPos->dir;
 	int			ikey = pstate->startikey;
 	bool		res;
 
+#ifdef USE_ASSERT_CHECKING
+	BTScanOpaque so = (BTScanOpaque) scan->opaque;
 	Assert(BTreeTupleGetNAtts(tuple, scan->indexRelation) == tupnatts);
 	Assert(!so->needPrimScan && !so->scanBehind && !so->oppositeDirCheck);
 	Assert(arrayKeys || so->numArrayKeys == 0);
+#endif
 
 	res = _bt_check_compare(scan, dir, tuple, tupnatts, tupdesc, arrayKeys,
 							pstate->forcenonrequired, &pstate->continuescan,
@@ -3195,7 +3200,8 @@ _bt_checkkeys_look_ahead(IndexScanDesc scan, BTReadPageState *pstate,
 						 int tupnatts, TupleDesc tupdesc)
 {
 	BTScanOpaque so = (BTScanOpaque) scan->opaque;
-	ScanDirection dir = so->currPos.dir;
+	BTScanPos	currPos = &so->state.currPos;
+	ScanDirection dir = currPos->dir;
 	OffsetNumber aheadoffnum;
 	IndexTuple	ahead;
 
@@ -3270,68 +3276,68 @@ _bt_checkkeys_look_ahead(IndexScanDesc scan, BTReadPageState *pstate,
  * called if so->numKilled > 0).
  *
  * Caller should not have a lock on the so->currPos page, but must hold a
- * buffer pin when !so->dropPin.  When we return, it still won't be locked.
+ * buffer pin when !state->dropPin.  When we return, it still won't be locked.
  * It'll continue to hold whatever pins were held before calling here.
  *
  * We match items by heap TID before assuming they are the right ones to set
  * LP_DEAD.  If the scan is one that holds a buffer pin on the target page
  * continuously from initially reading the items until applying this function
- * (if it is a !so->dropPin scan), VACUUM cannot have deleted any items on the
+ * (if it is a !state->dropPin scan), VACUUM cannot have deleted any items on the
  * page, so the page's TIDs can't have been recycled by now.  There's no risk
  * that we'll confuse a new index tuple that happens to use a recycled TID
  * with a now-removed tuple with the same TID (that used to be on this same
  * page).  We can't rely on that during scans that drop buffer pins eagerly
- * (so->dropPin scans), though, so we must condition setting LP_DEAD bits on
+ * (state->dropPin scans), though, so we must condition setting LP_DEAD bits on
  * the page LSN having not changed since back when _bt_readpage saw the page.
  * We totally give up on setting LP_DEAD bits when the page LSN changed.
  *
- * We give up much less often during !so->dropPin scans, but it still happens.
+ * We give up much less often during !state->dropPin scans, but it still happens.
  * We cope with cases where items have moved right due to insertions.  If an
  * item has moved off the current page due to a split, we'll fail to find it
  * and just give up on it.
  */
 void
-_bt_killitems(IndexScanDesc scan)
+_bt_killitems(IndexScanDesc scan, BTScanState state)
 {
 	Relation	rel = scan->indexRelation;
-	BTScanOpaque so = (BTScanOpaque) scan->opaque;
+	BTScanPos	pos = &state->currPos;
 	Page		page;
 	BTPageOpaque opaque;
 	OffsetNumber minoff;
 	OffsetNumber maxoff;
-	int			numKilled = so->numKilled;
+	int			numKilled = state->numKilled;
 	bool		killedsomething = false;
 	Buffer		buf;
 
 	Assert(numKilled > 0);
-	Assert(BTScanPosIsValid(so->currPos));
+	Assert(BTScanPosIsValid(state->currPos));
 	Assert(scan->heapRelation != NULL); /* can't be a bitmap index scan */
 
 	/* Always invalidate so->killedItems[] before leaving so->currPos */
-	so->numKilled = 0;
+	state->numKilled = 0;
 
-	if (!so->dropPin)
+	if (!state->dropPin)
 	{
 		/*
 		 * We have held the pin on this page since we read the index tuples,
 		 * so all we need to do is lock it.  The pin will have prevented
 		 * concurrent VACUUMs from recycling any of the TIDs on the page.
 		 */
-		Assert(BTScanPosIsPinned(so->currPos));
-		buf = so->currPos.buf;
+		Assert(BTScanPosIsPinned(*pos));
+		buf = pos->buf;
 		_bt_lockbuf(rel, buf, BT_READ);
 	}
 	else
 	{
 		XLogRecPtr	latestlsn;
 
-		Assert(!BTScanPosIsPinned(so->currPos));
+		Assert(!BTScanPosIsPinned(*pos));
 		Assert(RelationNeedsWAL(rel));
-		buf = _bt_getbuf(rel, so->currPos.currPage, BT_READ);
+		buf = _bt_getbuf(rel, pos->currPage, BT_READ);
 
 		latestlsn = BufferGetLSNAtomic(buf);
-		Assert(so->currPos.lsn <= latestlsn);
-		if (so->currPos.lsn != latestlsn)
+		Assert(pos->lsn <= latestlsn);
+		if (pos->lsn != latestlsn)
 		{
 			/* Modified, give up on hinting */
 			_bt_relbuf(rel, buf);
@@ -3348,12 +3354,12 @@ _bt_killitems(IndexScanDesc scan)
 
 	for (int i = 0; i < numKilled; i++)
 	{
-		int			itemIndex = so->killedItems[i];
-		BTScanPosItem *kitem = &so->currPos.items[itemIndex];
+		int			itemIndex = state->killedItems[i];
+		BTScanPosItem *kitem = &pos->items[itemIndex];
 		OffsetNumber offnum = kitem->indexOffset;
 
-		Assert(itemIndex >= so->currPos.firstItem &&
-			   itemIndex <= so->currPos.lastItem);
+		Assert(itemIndex >= pos->firstItem &&
+			   itemIndex <= pos->lastItem);
 		if (offnum < minoff)
 			continue;			/* pure paranoia */
 		while (offnum <= maxoff)
@@ -3378,7 +3384,7 @@ _bt_killitems(IndexScanDesc scan)
 				 * correctness.
 				 *
 				 * Note that the page may have been modified in almost any way
-				 * since we first read it (in the !so->dropPin case), so it's
+				 * since we first read it (in the !state->dropPin case), so it's
 				 * possible that this posting list tuple wasn't a posting list
 				 * tuple when we first encountered its heap TIDs.
 				 */
@@ -3394,7 +3400,7 @@ _bt_killitems(IndexScanDesc scan)
 					 * though only in the common case where the page can't
 					 * have been concurrently modified
 					 */
-					Assert(kitem->indexOffset == offnum || !so->dropPin);
+					Assert(kitem->indexOffset == offnum || !state->dropPin);
 
 					/*
 					 * Read-ahead to later kitems here.
@@ -3411,7 +3417,7 @@ _bt_killitems(IndexScanDesc scan)
 					 * correctly -- posting tuple still gets killed).
 					 */
 					if (pi < numKilled)
-						kitem = &so->currPos.items[so->killedItems[pi++]];
+						kitem = &state->currPos.items[state->killedItems[pi++]];
 				}
 
 				/*
@@ -3461,7 +3467,7 @@ _bt_killitems(IndexScanDesc scan)
 		MarkBufferDirtyHint(buf, true);
 	}
 
-	if (!so->dropPin)
+	if (!state->dropPin)
 		_bt_unlockbuf(rel, buf);
 	else
 		_bt_relbuf(rel, buf);
@@ -4299,4 +4305,15 @@ _bt_allequalimage(Relation rel, bool debugmessage)
 	}
 
 	return allequalimage;
+}
+
+/*
+ * _bt_allocate_tuple_workspaces() -- Allocate buffers for saving index tuples
+ * 		in index-only scans.
+ */
+void
+_bt_allocate_tuple_workspaces(BTScanState state)
+{
+	state->currTuples = (char *) palloc(BLCKSZ * 2);
+	state->markTuples = state->currTuples + BLCKSZ;
 }

@@ -1959,6 +1959,7 @@ _bt_preprocess_array_keys(IndexScanDesc scan, int *new_numberOfKeys)
 			/* Initialize generic BTArrayKeyInfo fields */
 			so->arrayKeys[numArrayKeys].scan_key = numArrayKeyData;
 			so->arrayKeys[numArrayKeys].num_elems = -1;
+			so->arrayKeys[numArrayKeys].ord_arg_loc = UNKNOWN_ORDER_ARG_LOCATION;
 
 			/* Initialize skip array specific BTArrayKeyInfo fields */
 			attr = TupleDescCompactAttr(RelationGetDescr(rel), attno_skip - 1);
