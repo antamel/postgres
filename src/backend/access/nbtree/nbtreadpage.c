@@ -192,10 +192,10 @@ _bt_readpage(IndexScanDesc scan, BTScanState state, ScanDirection dir,
 	{
 		/* allow next/prev page to be read by other worker without delay */
 		if (ScanDirectionIsForward(dir))
-			_bt_parallel_release(scan, pos->nextPage,
+			_bt_parallel_release(scan, state, pos->nextPage,
 								  pos->currPage);
 		else
-			_bt_parallel_release(scan,  pos->prevPage,
+			_bt_parallel_release(scan, state, pos->prevPage,
 								  pos->currPage);
 	}
 
