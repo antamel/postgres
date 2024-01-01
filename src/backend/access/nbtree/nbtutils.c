@@ -69,7 +69,6 @@ static void _bt_checkkeys_look_ahead(IndexScanDesc scan, BTReadPageState *pstate
 static int	_bt_keep_natts(Relation rel, IndexTuple lastleft,
 						   IndexTuple firstright, BTScanInsert itup_key);
 
-
 /*
  * _bt_mkscankey
  *		Build an insertion scan key that contains comparison data from itup
@@ -1391,7 +1390,7 @@ _bt_start_prim_scan(IndexScanDesc scan, ScanDirection dir)
 
 	/* The top-level index scan ran out of tuples in this scan direction */
 	if (scan->parallel_scan != NULL)
-		_bt_parallel_done(scan);
+		_bt_parallel_done(scan, &so->state);
 
 	return false;
 }
@@ -3730,6 +3729,39 @@ btproperty(Oid index_oid, int attno,
 			/* otherwise, btree can always return data */
 			*res = true;
 			return true;
+
+		case AMPROP_DISTANCE_ORDERABLE:
+			{
+				Oid			opclass,
+							opfamily,
+							opcindtype;
+
+				/* answer only for columns, not AM or whole index */
+				if (attno == 0)
+					return false;
+
+				opclass = get_index_column_opclass(index_oid, attno);
+
+				if (!OidIsValid(opclass))
+				{
+					*res = false;	/* non-key attribute */
+					return true;
+				}
+
+				if (!get_opclass_opfamily_and_input_type(opclass,
+														 &opfamily, &opcindtype))
+				{
+					*isnull = true;
+					return true;
+				}
+
+				*res = SearchSysCacheExists(AMOPSTRATEGY,
+											ObjectIdGetDatum(opfamily),
+											ObjectIdGetDatum(opcindtype),
+											ObjectIdGetDatum(opcindtype),
+											Int16GetDatum(BTMaxStrategyNumber));
+				return true;
+			}
 
 		default:
 			return false;		/* punt to generic code */
