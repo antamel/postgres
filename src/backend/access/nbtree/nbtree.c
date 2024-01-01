@@ -66,9 +66,12 @@ typedef enum
  */
 typedef struct BTParallelScanDescData
 {
-	BlockNumber btps_nextScanPage;	/* next page to be scanned */
-	BlockNumber btps_lastCurrPage;	/* page whose sibling link was copied into
-									 * btps_nextScanPage */
+	BlockNumber btps_forwardNextScanPage;	/* next page to be scanned */
+	BlockNumber btps_forwardLastCurrPage;	/* page whose sibling link was copied into
+									 * btps_forwardNextScanPage */
+	BlockNumber btps_backwardNextScanPage;	/* secondary kNN next page to be scanned */
+	BlockNumber btps_backwardLastCurrPage;	/* secondary kNN page whose sibling link was copied into
+									 * btps_backwardNextScanPage */
 	BTPS_State	btps_pageStatus;	/* indicates whether next page is
 									 * available for scan. see above for
 									 * possible states of parallel scan. */
@@ -121,8 +124,8 @@ bthandler(PG_FUNCTION_ARGS)
 		.amsupport = BTNProcs,
 		.amoptsprocnum = BTOPTIONS_PROC,
 		.amcanorder = true,
-		.amcanorderbyop = false,
-		.amorderbyopfirstcol = false,
+		.amcanorderbyop = true,
+		.amorderbyopfirstcol = true,
 		.amcanhash = false,
 		.amconsistentequality = true,
 		.amconsistentordering = true,
@@ -234,8 +237,15 @@ btgettuple(IndexScanDesc scan, ScanDirection dir)
 
 	Assert(scan->heapRelation != NULL);
 
+	if (scan->numberOfOrderBys > 0 && !ScanDirectionIsForward(dir))
+		elog(ERROR, "btree does not support backward order-by-distance scanning");
+
 	/* btree indexes are never lossy */
 	scan->xs_recheck = false;
+	scan->xs_recheckorderby = false;
+
+	if (so->scanDirection != NoMovementScanDirection)
+		dir = so->scanDirection;
 
 	/* Each loop iteration performs another primitive index scan */
 	do
@@ -245,7 +255,8 @@ btgettuple(IndexScanDesc scan, ScanDirection dir)
 		 * the appropriate direction.  If we haven't done so yet, we call
 		 * _bt_first() to get the first item in the scan.
 		 */
-		if (!BTScanPosIsValid(state->currPos))
+		if (!BTScanPosIsValid(state->currPos) &&
+			(!so->backwardState || !BTScanPosIsValid(so->backwardState->currPos)))
 			res = _bt_first(scan, dir);
 		else
 		{
@@ -342,9 +353,6 @@ btbeginscan(Relation rel, int nkeys, int norderbys)
 	IndexScanDesc scan;
 	BTScanOpaque so;
 
-	/* no order by operators allowed */
-	Assert(norderbys == 0);
-
 	/* get the scan */
 	scan = RelationGetIndexScan(rel, nkeys, norderbys);
 
@@ -374,6 +382,9 @@ btbeginscan(Relation rel, int nkeys, int norderbys)
 	 * scan->xs_itupdesc whether we'll need it or not, since that's so cheap.
 	 */
 	so->state.currTuples = so->state.markTuples = NULL;
+	so->backwardState = NULL;
+	so->distanceTypeByVal = true;
+	so->scanDirection = NoMovementScanDirection;
 
 	scan->xs_itupdesc = RelationGetDescr(rel);
 
@@ -403,6 +414,8 @@ _bt_release_current_position(IndexScanDesc scan, BTScanState state,
 static void
 _bt_release_scan_state(IndexScanDesc scan, BTScanState state, bool free)
 {
+	BTScanOpaque so = (BTScanOpaque) scan->opaque;
+
 	/* No need to invalidate positions, if the RAM is about to be freed. */
 	_bt_release_current_position(scan, state, !free);
 
@@ -419,6 +432,18 @@ _bt_release_scan_state(IndexScanDesc scan, BTScanState state, bool free)
 	}
 	else
 		BTScanPosInvalidate(state->markPos);
+
+	if (!so->distanceTypeByVal)
+	{
+		if (DatumGetPointer(state->currDistance))
+			pfree(DatumGetPointer(state->currDistance));
+
+		if (DatumGetPointer(state->markDistance))
+			pfree(DatumGetPointer(state->markDistance));
+	}
+
+	state->currDistance = (Datum) 0;
+	state->markDistance = (Datum) 0;
 }
 
 /*
@@ -481,6 +506,14 @@ btrescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 		memcpy(scan->keyData, scankey, scan->numberOfKeys * sizeof(ScanKeyData));
 	so->numberOfKeys = 0;		/* until _bt_preprocess_keys sets it */
 	so->numArrayKeys = 0;		/* ditto */
+
+	if (orderbys && scan->numberOfOrderBys > 0)
+		memmove(scan->orderByData,
+				orderbys,
+				scan->numberOfOrderBys * sizeof(ScanKeyData));
+
+	so->scanDirection = NoMovementScanDirection;
+	so->distanceTypeByVal = true;
 }
 
 /*
@@ -493,6 +526,12 @@ btendscan(IndexScanDesc scan)
 
 	_bt_release_scan_state(scan, &so->state, true);
 
+	if (so->backwardState)
+	{
+		_bt_release_scan_state(scan, so->backwardState, true);
+		pfree(so->backwardState);
+	}
+
 	/* Release storage */
 	if (so->keyData != NULL)
 		pfree(so->keyData);
@@ -504,7 +543,7 @@ btendscan(IndexScanDesc scan)
 }
 
 static void
-_bt_mark_current_position(BTScanState state)
+_bt_mark_current_position(BTScanOpaque so, BTScanState state)
 {
 	/* There may be an old mark with a pin (but no lock). */
 	BTScanPosUnpinIfPinned(state->markPos);
@@ -522,6 +561,25 @@ _bt_mark_current_position(BTScanState state)
 		BTScanPosInvalidate(state->markPos);
 		state->markItemIndex = -1;
 	}
+
+	if (so->backwardState)
+	{
+		if (!so->distanceTypeByVal && DatumGetPointer(state->markDistance))
+			pfree(DatumGetPointer(state->markDistance));
+
+		if (!BTScanPosIsValid(state->currPos) || state->currIsNull)
+		{
+			state->markIsNull = true;
+			state->markDistance = (Datum) 0;
+		}
+		else
+		{
+			state->markIsNull = false;
+			state->markDistance = datumCopy(state->currDistance,
+											so->distanceTypeByVal,
+											so->distanceTypeLen);
+		}
+	}
 }
 
 /*
@@ -532,7 +590,13 @@ btmarkpos(IndexScanDesc scan)
 {
 	BTScanOpaque so = (BTScanOpaque) scan->opaque;
 
-	_bt_mark_current_position(&so->state);
+	_bt_mark_current_position(so, &so->state);
+
+	if (so->backwardState)
+	{
+		_bt_mark_current_position(so, so->backwardState);
+		so->markRightIsNearest = so->currRightIsNearest;
+	}
 }
 
 static void
@@ -580,6 +644,22 @@ _bt_restore_marked_position(IndexScanDesc scan, BTScanState state)
 				so->needPrimScan = false;
 			}
 		}
+	}
+
+	/*
+	 * For bidirectional nearest neighbor scan we also need to restore the
+	 * distance to the current item.
+	 */
+	if (so->useBidirectionalKnnScan)
+	{
+		if (!so->distanceTypeByVal && DatumGetPointer(state->currDistance))
+			pfree(DatumGetPointer(state->currDistance));
+
+		state->currIsNull = state->markIsNull;
+		state->currDistance = state->markIsNull ? (Datum) 0 :
+			datumCopy(state->markDistance,
+					  so->distanceTypeByVal,
+					  so->distanceTypeLen);
 	}
 }
 
@@ -718,7 +798,7 @@ _bt_start_prim_scan(IndexScanDesc scan)
 
 	/* The top-level index scan ran out of tuples in this scan direction */
 	if (scan->parallel_scan != NULL)
-		_bt_parallel_done(scan);
+		_bt_parallel_done(scan, &so->state);
 
 	return false;
 }
@@ -829,8 +909,10 @@ btinitparallelscan(void *target)
 
 	LWLockInitialize(&bt_target->btps_lock,
 					 LWTRANCHE_PARALLEL_BTREE_SCAN);
-	bt_target->btps_nextScanPage = InvalidBlockNumber;
-	bt_target->btps_lastCurrPage = InvalidBlockNumber;
+	bt_target->btps_forwardNextScanPage = InvalidBlockNumber;
+	bt_target->btps_forwardLastCurrPage = InvalidBlockNumber;
+	bt_target->btps_backwardNextScanPage = InvalidBlockNumber;
+	bt_target->btps_backwardLastCurrPage = InvalidBlockNumber;
 	bt_target->btps_pageStatus = BTPARALLEL_NOT_INITIALIZED;
 	ConditionVariableInit(&bt_target->btps_cv);
 }
@@ -855,8 +937,10 @@ btparallelrescan(IndexScanDesc scan)
 	 * consistency.
 	 */
 	LWLockAcquire(&btscan->btps_lock, LW_EXCLUSIVE);
-	btscan->btps_nextScanPage = InvalidBlockNumber;
-	btscan->btps_lastCurrPage = InvalidBlockNumber;
+	btscan->btps_forwardNextScanPage = InvalidBlockNumber;
+	btscan->btps_forwardLastCurrPage = InvalidBlockNumber;
+	btscan->btps_backwardNextScanPage = InvalidBlockNumber;
+	btscan->btps_backwardLastCurrPage = InvalidBlockNumber;
 	btscan->btps_pageStatus = BTPARALLEL_NOT_INITIALIZED;
 	LWLockRelease(&btscan->btps_lock);
 }
@@ -882,17 +966,20 @@ btparallelrescan(IndexScanDesc scan)
  * the return value is false.
  */
 bool
-_bt_parallel_seize(IndexScanDesc scan, BlockNumber *next_scan_page,
+_bt_parallel_seize(IndexScanDesc scan, BTScanState state,
+				   BlockNumber *next_scan_page,
 				   BlockNumber *last_curr_page, bool first)
 {
 	Relation	rel = scan->indexRelation;
 	BTScanOpaque so = (BTScanOpaque) scan->opaque;
-	BTScanPos	currPos = &so->state.currPos;
+	BTScanPos	currPos = &state->currPos;
 	bool		exit_loop = false,
 				status = true,
 				endscan = false;
 	ParallelIndexScanDesc parallel_scan = scan->parallel_scan;
 	BTParallelScanDesc btscan;
+	BlockNumber *nextScanPage,
+				*lastCurrPage;
 
 	*next_scan_page = InvalidBlockNumber;
 	*last_curr_page = InvalidBlockNumber;
@@ -929,6 +1016,14 @@ _bt_parallel_seize(IndexScanDesc scan, BlockNumber *next_scan_page,
 	btscan = (BTParallelScanDesc) OffsetToPointer(parallel_scan,
 												  parallel_scan->ps_offset_am);
 
+	nextScanPage = state == so->backwardState ?
+		&btscan->btps_backwardNextScanPage :
+		&btscan->btps_forwardNextScanPage;
+
+	lastCurrPage = state == so->backwardState ?
+		&btscan->btps_backwardLastCurrPage :
+		&btscan->btps_forwardLastCurrPage;
+
 	while (1)
 	{
 		LWLockAcquire(&btscan->btps_lock, LW_EXCLUSIVE);
@@ -939,7 +1034,7 @@ _bt_parallel_seize(IndexScanDesc scan, BlockNumber *next_scan_page,
 			status = false;
 		}
 		else if (btscan->btps_pageStatus == BTPARALLEL_IDLE &&
-				 btscan->btps_nextScanPage == P_NONE)
+				 *nextScanPage == P_NONE)
 		{
 			/* End this parallel index scan */
 			status = false;
@@ -983,9 +1078,9 @@ _bt_parallel_seize(IndexScanDesc scan, BlockNumber *next_scan_page,
 			 * of advancing it to a new page!
 			 */
 			btscan->btps_pageStatus = BTPARALLEL_ADVANCING;
-			Assert(btscan->btps_nextScanPage != P_NONE);
-			*next_scan_page = btscan->btps_nextScanPage;
-			*last_curr_page = btscan->btps_lastCurrPage;
+			Assert(*nextScanPage != P_NONE);
+			*next_scan_page = *nextScanPage;
+			*last_curr_page = *lastCurrPage;
 			exit_loop = true;
 		}
 		LWLockRelease(&btscan->btps_lock);
@@ -997,7 +1092,7 @@ _bt_parallel_seize(IndexScanDesc scan, BlockNumber *next_scan_page,
 
 	/* When the scan has reached the rightmost (or leftmost) page, end it */
 	if (endscan)
-		_bt_parallel_done(scan);
+		_bt_parallel_done(scan, state);
 
 	return status;
 }
@@ -1021,23 +1116,54 @@ _bt_parallel_seize(IndexScanDesc scan, BlockNumber *next_scan_page,
  * scan can never change.
  */
 void
-_bt_parallel_release(IndexScanDesc scan, BlockNumber next_scan_page,
+_bt_parallel_release(IndexScanDesc scan, BTScanState state,
+					 BlockNumber next_scan_page,
 					 BlockNumber curr_page)
 {
+	BTScanOpaque so = (BTScanOpaque) scan->opaque;
 	ParallelIndexScanDesc parallel_scan = scan->parallel_scan;
 	BTParallelScanDesc btscan;
+	BlockNumber *scanPage;
+	BlockNumber *otherScanPage;
+	BlockNumber *lastCurrPage;
+	bool		status_changed = false;
+	bool		knnScan = so->useBidirectionalKnnScan;
 
 	Assert(BlockNumberIsValid(next_scan_page));
 
 	btscan = (BTParallelScanDesc) OffsetToPointer(parallel_scan,
 												  parallel_scan->ps_offset_am);
 
+	Assert(state);
+	if (state != so->backwardState)
+	{
+		scanPage = &btscan->btps_forwardNextScanPage;
+		otherScanPage = &btscan->btps_backwardNextScanPage;
+	}
+	else
+	{
+		scanPage = &btscan->btps_backwardNextScanPage;
+		otherScanPage = &btscan->btps_forwardNextScanPage;
+	}
+
+	lastCurrPage = state == so->backwardState ?
+				   &btscan->btps_backwardLastCurrPage :
+				   &btscan->btps_forwardLastCurrPage;
+
 	LWLockAcquire(&btscan->btps_lock, LW_EXCLUSIVE);
-	btscan->btps_nextScanPage = next_scan_page;
-	btscan->btps_lastCurrPage = curr_page;
+	*scanPage = next_scan_page;
+	*lastCurrPage = curr_page;
 	btscan->btps_pageStatus = BTPARALLEL_IDLE;
+	/* switch to idle state only if both KNN pages are initialized */
+	if (!knnScan || *otherScanPage != InvalidBlockNumber)
+	{
+		btscan->btps_pageStatus = BTPARALLEL_IDLE;
+		status_changed = true;
+	}
 	LWLockRelease(&btscan->btps_lock);
-	ConditionVariableSignal(&btscan->btps_cv);
+
+	if (status_changed)
+		ConditionVariableSignal(&btscan->btps_cv);
 }
 
 /*
@@ -1048,14 +1174,16 @@ _bt_parallel_release(IndexScanDesc scan, BlockNumber next_scan_page,
  * advance to the next page.
  */
 void
-_bt_parallel_done(IndexScanDesc scan)
+_bt_parallel_done(IndexScanDesc scan, BTScanState state)
 {
 	BTScanOpaque so = (BTScanOpaque) scan->opaque;
 	ParallelIndexScanDesc parallel_scan = scan->parallel_scan;
 	BTParallelScanDesc btscan;
+	BlockNumber *nextScanPage;
 	bool		status_changed = false;
+	bool		knnScan = so->useBidirectionalKnnScan;
 
-	Assert(!BTScanPosIsValid(so->state.currPos));
+	Assert(!BTScanPosIsValid(state->currPos));
 
 	/* Do nothing, for non-parallel scans */
 	if (parallel_scan == NULL)
@@ -1071,17 +1199,34 @@ _bt_parallel_done(IndexScanDesc scan)
 	btscan = (BTParallelScanDesc) OffsetToPointer(parallel_scan,
 												  parallel_scan->ps_offset_am);
 
+	Assert(state);
+	nextScanPage = state == so->backwardState ?
+							&btscan->btps_forwardNextScanPage :
+							&btscan->btps_backwardNextScanPage;
+
 	/*
 	 * Mark the parallel scan as done, unless some other process did so
 	 * already
 	 */
 	LWLockAcquire(&btscan->btps_lock, LW_EXCLUSIVE);
 	Assert(btscan->btps_pageStatus != BTPARALLEL_NEED_PRIMSCAN);
-	if (btscan->btps_pageStatus != BTPARALLEL_DONE)
+
+	status_changed = true;
+
+	/* switch to "done" state only if both KNN scans are done */
+	if (!knnScan || *nextScanPage == P_NONE)
 	{
+		if (btscan->btps_pageStatus == BTPARALLEL_DONE)
+			status_changed = false;
+
 		btscan->btps_pageStatus = BTPARALLEL_DONE;
-		status_changed = true;
 	}
+	/* else switch to "idle" state only if both KNN scans are initialized */
+	else if (*nextScanPage != InvalidBlockNumber)
+		btscan->btps_pageStatus = BTPARALLEL_IDLE;
+	else
+		status_changed = false;
+
 	LWLockRelease(&btscan->btps_lock);
 
 	/* wake up all the workers associated with this parallel scan */
@@ -1102,20 +1247,34 @@ _bt_parallel_primscan_schedule(IndexScanDesc scan, BlockNumber curr_page)
 {
 	Relation	rel = scan->indexRelation;
 	BTScanOpaque so = (BTScanOpaque) scan->opaque;
+	BTScanState state = &so->state;
 	ParallelIndexScanDesc parallel_scan = scan->parallel_scan;
 	BTParallelScanDesc btscan;
+	BlockNumber *nextScanPage,
+				*lastCurrPage;
 
 	Assert(so->numArrayKeys);
 
 	btscan = (BTParallelScanDesc) OffsetToPointer(parallel_scan,
 												  parallel_scan->ps_offset_am);
 
+	if (state != so->backwardState)
+	{
+		nextScanPage = &btscan->btps_forwardNextScanPage;
+		lastCurrPage = &btscan->btps_forwardLastCurrPage;
+	}
+	else
+	{
+		nextScanPage = &btscan->btps_backwardNextScanPage;
+		lastCurrPage = &btscan->btps_backwardLastCurrPage;
+	}
+
 	LWLockAcquire(&btscan->btps_lock, LW_EXCLUSIVE);
-	if (btscan->btps_lastCurrPage == curr_page &&
+	if (*lastCurrPage == curr_page &&
 		btscan->btps_pageStatus == BTPARALLEL_IDLE)
 	{
-		btscan->btps_nextScanPage = InvalidBlockNumber;
-		btscan->btps_lastCurrPage = InvalidBlockNumber;
+		*nextScanPage = InvalidBlockNumber;
+		*lastCurrPage = InvalidBlockNumber;
 		btscan->btps_pageStatus = BTPARALLEL_NEED_PRIMSCAN;
 
 		/* Serialize scan's current array keys */
@@ -1133,6 +1292,12 @@ btrestrpos(IndexScanDesc scan)
 	BTScanOpaque so = (BTScanOpaque) scan->opaque;
 
 	_bt_restore_marked_position(scan, &so->state);
+
+	if (so->backwardState)
+	{
+		_bt_restore_marked_position(scan, so->backwardState);
+		so->currRightIsNearest = so->markRightIsNearest;
+	}
 }
 
 /*
