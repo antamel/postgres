@@ -1320,7 +1320,7 @@ _bt_start_prim_scan(IndexScanDesc scan, ScanDirection dir)
 
 	/* The top-level index scan ran out of tuples in this scan direction */
 	if (scan->parallel_scan != NULL)
-		_bt_parallel_done(scan);
+		_bt_parallel_done(scan, &so->state);
 
 	return false;
 }
@@ -3722,6 +3722,39 @@ btproperty(Oid index_oid, int attno,
 			*res = true;
 			return true;
 
+		case AMPROP_DISTANCE_ORDERABLE:
+			{
+				Oid			opclass,
+							opfamily,
+							opcindtype;
+
+				/* answer only for columns, not AM or whole index */
+				if (attno == 0)
+					return false;
+
+				opclass = get_index_column_opclass(index_oid, attno);
+
+				if (!OidIsValid(opclass))
+				{
+					*res = false;	/* non-key attribute */
+					return true;
+				}
+
+				if (!get_opclass_opfamily_and_input_type(opclass,
+														 &opfamily, &opcindtype))
+				{
+					*isnull = true;
+					return true;
+				}
+
+				*res = SearchSysCacheExists(AMOPSTRATEGY,
+											ObjectIdGetDatum(opfamily),
+											ObjectIdGetDatum(opcindtype),
+											ObjectIdGetDatum(opcindtype),
+											Int16GetDatum(BTMaxStrategyNumber));
+				return true;
+			}
+
 		default:
 			return false;		/* punt to generic code */
 	}
@@ -4316,4 +4349,30 @@ _bt_allocate_tuple_workspaces(BTScanState state)
 {
 	state->currTuples = (char *) palloc(BLCKSZ * 2);
 	state->markTuples = state->currTuples + BLCKSZ;
+}
+
+int
+_bt_init_knn_start_keys(IndexScanDesc scan, ScanKey *startKeys, ScanKey bufKeys)
+{
+	ScanKey		ord = scan->orderByData;
+	int			indopt = scan->indexRelation->rd_indoption[ord->sk_attno - 1];
+	int			flags = (indopt << SK_BT_INDOPTION_SHIFT) |
+	SK_ORDER_BY |
+	SK_SEARCHNULL;				/* only for invalid procedure oid, see assert
+								 * in ScanKeyEntryInitialize() */
+	int			keysCount = 0;
+
+	/* Init btree search key with ordering key argument. */
+	ScanKeyEntryInitialize(&bufKeys[0],
+						   flags,
+						   ord->sk_attno,
+						   BTMaxStrategyNumber,
+						   ord->sk_subtype,
+						   ord->sk_collation,
+						   InvalidOid,
+						   ord->sk_argument);
+
+	startKeys[keysCount++] = &bufKeys[0];
+
+	return keysCount;
 }
