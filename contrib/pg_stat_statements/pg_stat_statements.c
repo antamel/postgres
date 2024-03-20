@@ -74,6 +74,10 @@
 #include "utils/memutils.h"
 #include "utils/timestamp.h"
 
+#include "access/xlog.h"
+#include "access/xlog_internal.h"
+#include "access/xloginsert.h"
+
 PG_MODULE_MAGIC;
 
 /* Location of permanent stats file (valid when database is shut down) */
@@ -324,6 +328,7 @@ PG_FUNCTION_INFO_V1(pg_stat_statements_info);
 static void pgss_shmem_request(void);
 static void pgss_shmem_startup(void);
 static void pgss_shmem_shutdown(int code, Datum arg);
+static void pgss_shmem_dump(bool shutdown);
 static void pgss_post_parse_analyze(ParseState *pstate, Query *query,
 									JumbleState *jstate);
 static PlannedStmt *pgss_planner(Query *parse,
@@ -370,6 +375,17 @@ static void fill_in_constant_lengths(JumbleState *jstate, const char *query,
 									 int query_loc);
 static int	comp_location(const void *a, const void *b);
 
+/* RMGR API */
+#define CUSTOMRMGR_ID		RM_EXPERIMENTAL_ID
+#define CUSTOMRMGR_NAME		"pgss_rmgr"
+
+static void rmgr_checkpoint(int flags);
+
+/* RMGR data */
+const RmgrData pgss_rmgr = {
+	.rm_name = CUSTOMRMGR_NAME,
+	.rm_checkpoint = rmgr_checkpoint,
+};
 
 /*
  * Module load callback
@@ -456,6 +472,8 @@ _PG_init(void)
 							 NULL);
 
 	MarkGUCPrefixReserved("pg_stat_statements");
+
+	RegisterCustomRmgr(CUSTOMRMGR_ID, &pgss_rmgr);
 
 	/*
 	 * Install hooks.
@@ -721,24 +739,33 @@ fail:
 }
 
 /*
- * shmem_shutdown hook: Dump statistics into file.
- *
- * Note: we don't bother with acquiring lock, because there should be no
- * other processes running when this is called.
+ * shmem_shutdown hook
  */
 static void
 pgss_shmem_shutdown(int code, Datum arg)
 {
+	bool 		shutdown = DatumGetBool(arg);
+
+	/* Don't try to dump during a crash. */
+	if (code)
+		return;
+
+	pgss_shmem_dump(shutdown);
+}
+
+/*
+ * Dump statistics into file during shmem shutdown or checkpoint
+ */
+static void
+pgss_shmem_dump(bool shutdown)
+{
+
 	FILE	   *file;
 	char	   *qbuffer = NULL;
 	Size		qbuffer_size = 0;
 	HASH_SEQ_STATUS hash_seq;
 	int32		num_entries;
 	pgssEntry  *entry;
-
-	/* Don't try to dump during a crash. */
-	if (code)
-		return;
 
 	/* Safety check ... shouldn't get here unless shmem is set up. */
 	if (!pgss || !pgss_hash)
@@ -756,6 +783,9 @@ pgss_shmem_shutdown(int code, Datum arg)
 		goto error;
 	if (fwrite(&PGSS_PG_MAJOR_VERSION, sizeof(uint32), 1, file) != 1)
 		goto error;
+
+	LWLockAcquire(pgss->lock, LW_EXCLUSIVE);
+
 	num_entries = hash_get_num_entries(pgss_hash);
 	if (fwrite(&num_entries, sizeof(int32), 1, file) != 1)
 		goto error;
@@ -806,8 +836,10 @@ pgss_shmem_shutdown(int code, Datum arg)
 	(void) durable_rename(PGSS_DUMP_FILE ".tmp", PGSS_DUMP_FILE, LOG);
 
 	/* Unlink query-texts file; it's not needed while shutdown */
-	unlink(PGSS_TEXT_FILE);
+	if(shutdown)
+		unlink(PGSS_TEXT_FILE);
 
+	LWLockRelease(pgss->lock);
 	return;
 
 error:
@@ -819,7 +851,11 @@ error:
 	if (file)
 		FreeFile(file);
 	unlink(PGSS_DUMP_FILE ".tmp");
-	unlink(PGSS_TEXT_FILE);
+
+	if(shutdown)
+		unlink(PGSS_TEXT_FILE);
+
+	LWLockRelease(pgss->lock);
 }
 
 /*
@@ -3009,4 +3045,10 @@ comp_location(const void *a, const void *b)
 	int			r = ((const LocationLen *) b)->location;
 
 	return pg_cmp_s32(l, r);
+}
+
+static void
+rmgr_checkpoint(int flags)
+{
+	pgss_shmem_dump(flags & CHECKPOINT_IS_SHUTDOWN);
 }
