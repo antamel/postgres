@@ -12,6 +12,7 @@
 #include <ctype.h>
 #include <limits.h>				/* for CHAR_MIN */
 
+#include "access/xlogfilepaths.h"
 #include "common/string.h"
 #include "pg_upgrade.h"
 
@@ -757,10 +758,10 @@ disable_old_cluster(transferMode transfer_mode)
 				new_path[MAXPGPATH];
 
 	/* rename pg_control so old server cannot be accidentally started */
-	prep_status("Adding \".old\" suffix to old global/pg_control");
+	prep_status("Adding \".old\" suffix to old " XLOG_CONTROL_FILE);
 
-	snprintf(old_path, sizeof(old_path), "%s/global/pg_control", old_cluster.pgdata);
-	snprintf(new_path, sizeof(new_path), "%s/global/pg_control.old", old_cluster.pgdata);
+	snprintf(old_path, sizeof(old_path), "%s/%s", old_cluster.pgdata, XLOG_CONTROL_FILE);
+	snprintf(new_path, sizeof(new_path), "%s/%s.old", old_cluster.pgdata, XLOG_CONTROL_FILE);
 	if (pg_mv_file(old_path, new_path) != 0)
 		pg_fatal("could not rename file \"%s\" to \"%s\": %m",
 				 old_path, new_path);
