@@ -41,8 +41,9 @@ unlink("$backup_dir/postmaster.pid")
   or BAIL_OUT("unable to unlink $backup_dir/postmaster.pid");
 unlink("$backup_dir/postmaster.opts")
   or BAIL_OUT("unable to unlink $backup_dir/postmaster.opts");
-unlink("$backup_dir/global/pg_control")
-  or BAIL_OUT("unable to unlink $backup_dir/global/pg_control");
+my $controlfile = $node_primary->controlfile;
+unlink("$backup_dir/$controlfile")
+  or BAIL_OUT("unable to unlink $backup_dir/$controlfile");
 
 rmtree("$backup_dir/pg_wal")
   or BAIL_OUT("unable to unlink contents of $backup_dir/pg_wal");
@@ -69,9 +70,9 @@ $node_primary->poll_query_until('postgres',
 $node_primary->safe_psql('postgres', "checkpoint");
 
 # Copy pg_control last so it contains the new checkpoint.
-copy($node_primary->data_dir . '/global/pg_control',
-	"$backup_dir/global/pg_control")
-  or BAIL_OUT("unable to copy global/pg_control");
+copy($node_primary->data_dir . '/' . $controlfile,
+	"$backup_dir/$controlfile")
+  or BAIL_OUT("unable to copy $controlfile");
 
 # Save the name segment that will be archived by pg_backup_stop().
 # This is copied to the pg_wal directory of the node whose recovery

@@ -23,7 +23,7 @@ command_like([ 'pg_controldata', $node->data_dir ],
 
 # check with a corrupted pg_control
 
-my $pg_control = $node->data_dir . '/global/pg_control';
+my $pg_control = $node->data_dir . '/' . $node->controlfile;
 my $size = -s $pg_control;
 
 open my $fh, '>', $pg_control or BAIL_OUT($!);

@@ -23,6 +23,7 @@ $primary->start;
 my $source_ts_path = PostgreSQL::Test::Utils::tempdir_short();
 my $source_ts_prefix = $source_ts_path;
 $source_ts_prefix =~ s!(^[A-Z]:/[^/]*)/.*!$1!;
+my $controlfile = $primary->controlfile;
 
 $primary->safe_psql('postgres', <<EOM);
 CREATE TABLE x1 (a int);
@@ -280,7 +281,7 @@ sub mutilate_missing_tablespace
 sub mutilate_append_to_file
 {
 	my ($backup_path) = @_;
-	append_to_file "$backup_path/global/pg_control", 'x';
+	append_to_file "$backup_path/$controlfile", 'x';
 	return;
 }
 

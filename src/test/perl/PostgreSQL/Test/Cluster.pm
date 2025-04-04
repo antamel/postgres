@@ -263,6 +263,20 @@ sub logfile
 
 =pod
 
+=item $node->controlfile()
+
+Path to the PostgreSQL control file for this instance.
+
+=cut
+
+sub controlfile
+{
+	my ($self) = @_;
+	return $self->{_controlfile};
+}
+
+=pod
+
 =item $node->connstr()
 
 Get a libpq connection string that will establish a connection to
@@ -1595,6 +1609,10 @@ sub new
 		}
 	}
 
+	my @scan_result = PostgreSQL::Test::Utils::scan_server_header(
+						'access/xlog_internal.h',
+						'#define\s+XLOG_CONTROL_FILE\s+"(.*)"');
+	my $controlfile = $scan_result[0];
 	my $testname = basename($0);
 	$testname =~ s/\.[^.]+$//;
 	my $node = {
@@ -1607,7 +1625,8 @@ sub new
 		_logfile_base =>
 		  "$PostgreSQL::Test::Utils::log_path/${testname}_${name}",
 		_logfile =>
-		  "$PostgreSQL::Test::Utils::log_path/${testname}_${name}.log"
+		  "$PostgreSQL::Test::Utils::log_path/${testname}_${name}.log",
+		_controlfile => $controlfile
 	};
 
 	if ($params{install_path})

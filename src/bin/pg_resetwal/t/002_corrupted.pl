@@ -13,7 +13,7 @@ use Test::More;
 my $node = PostgreSQL::Test::Cluster->new('main');
 $node->init;
 
-my $pg_control = $node->data_dir . '/global/pg_control';
+my $pg_control = $node->data_dir . '/' . $node->controlfile;
 my $size = -s $pg_control;
 
 # Read out the head of the file to get PG_CONTROL_VERSION in
