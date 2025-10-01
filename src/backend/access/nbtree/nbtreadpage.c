@@ -92,6 +92,7 @@ static void _bt_checkkeys_look_ahead(IndexScanDesc scan, BTReadPageState *pstate
 static bool _bt_advance_array_keys(IndexScanDesc scan, BTReadPageState *pstate,
 								   IndexTuple tuple, int tupnatts, TupleDesc tupdesc,
 								   int sktrig, bool sktrig_required);
+static void _bt_force_advance_array_keys(IndexScanDesc scan, BTReadPageState *pstate);
 static bool _bt_advance_array_keys_increment(IndexScanDesc scan, ScanDirection dir,
 											 bool *skip_array_set);
 static bool _bt_array_increment(Relation rel, ScanKey skey, BTArrayKeyInfo *array);
@@ -101,9 +102,6 @@ static void _bt_array_set_low_or_high(Relation rel, ScanKey skey,
 static void _bt_skiparray_set_element(Relation rel, ScanKey skey, BTArrayKeyInfo *array,
 									  int32 set_elem_result, Datum tupdatum, bool tupnull);
 static void _bt_skiparray_set_isnull(Relation rel, ScanKey skey, BTArrayKeyInfo *array);
-static inline int32 _bt_compare_array_skey(FmgrInfo *orderproc,
-										   Datum tupdatum, bool tupnull,
-										   Datum arrdatum, ScanKey cur);
 static void _bt_binsrch_skiparray_skey(bool cur_elem_trig, ScanDirection dir,
 									   Datum tupdatum, bool tupnull,
 									   BTArrayKeyInfo *array, ScanKey cur,
@@ -187,6 +185,22 @@ _bt_readpage(IndexScanDesc scan, BTScanState state, ScanDirection dir,
 	pstate.rechecks = 0;
 	pstate.targetdistance = 0;
 	pstate.nskipadvances = 0;
+	pstate.ordarg_inside_array = false;
+
+	/*
+	 * Check if it is a type C scan. See the comment to the enum
+	 * BTOrderArgLocation.
+	 */
+	for (int i = 0; i < so->numArrayKeys; i++)
+	{
+		BTArrayKeyInfo *array = &so->arrayKeys[i];
+
+		if (array->ord_arg_loc == WITHIN_ORDER_ARG_LOCATION)
+		{
+			pstate.ordarg_inside_array = true;
+			break;
+		}
+	}
 
 	if (scan->parallel_scan)
 	{
@@ -206,8 +220,13 @@ _bt_readpage(IndexScanDesc scan, BTScanState state, ScanDirection dir,
 		/* SK_SEARCHARRAY forward scans must provide high key up front */
 		if (arrayKeys)
 		{
-			if (!P_RIGHTMOST(opaque))
+			if (!P_RIGHTMOST(opaque) || pstate.ordarg_inside_array)
 			{
+				/*
+				 * In the case C of distance ordering it must also be provided
+				 * for the final index page as forced primscan may occur
+				 * there.
+				 */
 				ItemId		iid = PageGetItemId(page, P_HIKEY);
 
 				pstate.finaltup = (IndexTuple) PageGetItem(page, iid);
@@ -230,9 +249,11 @@ _bt_readpage(IndexScanDesc scan, BTScanState state, ScanDirection dir,
 
 		/*
 		 * Consider pstate.startikey optimization once the ongoing primitive
-		 * index scan has already read at least one page
+		 * index scan has already read at least one page.
+		 * In WITHIN_ORDER_ARG_LOCATION case we need to consider every key
+		 * since any of them requires a new primscan and can not be skipped.
 		 */
-		if (!pstate.firstpage && minoff < maxoff)
+		if (!pstate.firstpage && minoff < maxoff &&	!pstate.ordarg_inside_array)
 			_bt_set_startikey(scan, &pstate);
 
 		/* load items[] in ascending order */
@@ -342,6 +363,17 @@ _bt_readpage(IndexScanDesc scan, BTScanState state, ScanDirection dir,
 			_bt_checkkeys(scan, &pstate, arrayKeys, itup, truncatt);
 		}
 
+		/*
+		 * Consider advancing the array keys in the C case of distance
+		 * ordering (see the comment to the enum BTOrderArgLocation). On
+		 * scanning forward, when the scan reaches the very last tuple, a
+		 * situation may arise where there may be some unpassed array elements
+		 * remaining, the first of which is in the opposite direction to the
+		 * scan just completed, so another primitive scan is required.
+		 */
+		if (pstate.ordarg_inside_array && pstate.continuescan && P_RIGHTMOST(opaque))
+			_bt_force_advance_array_keys(scan, &pstate);
+
 		if (!pstate.continuescan)
 			pos->moreRight = false;
 
@@ -379,9 +411,11 @@ _bt_readpage(IndexScanDesc scan, BTScanState state, ScanDirection dir,
 
 		/*
 		 * Consider pstate.startikey optimization once the ongoing primitive
-		 * index scan has already read at least one page
+		 * index scan has already read at least one page.
+		 * In WITHIN_ORDER_ARG_LOCATION case we need to consider every key
+		 * since any of them requires a new primscan and can not be skipped.
 		 */
-		if (!pstate.firstpage && minoff < maxoff)
+		if (!pstate.firstpage && minoff < maxoff &&	!pstate.ordarg_inside_array)
 			_bt_set_startikey(scan, &pstate);
 
 		/* load items[] in descending order */
@@ -494,6 +528,14 @@ _bt_readpage(IndexScanDesc scan, BTScanState state, ScanDirection dir,
 					}
 				}
 			}
+
+			/*
+			 * See the comment above for a similar case when scanning forward.
+			 * But for the very first tuple in the index.
+			 */
+			if (pstate.ordarg_inside_array && pstate.continuescan && P_LEFTMOST(opaque))
+				_bt_force_advance_array_keys(scan, &pstate);
+
 			/* When !continuescan, there can't be any more matches, so stop */
 			if (!pstate.continuescan)
 				break;
@@ -2621,6 +2663,14 @@ _bt_advance_array_keys(IndexScanDesc scan, BTReadPageState *pstate,
 	}
 
 	/*
+	 * For case C of distance ordering we use old behaviour: a separate
+	 * primscan for every SAOP element. Future optimization is possible here
+	 * although.
+	 */
+	if (pstate->ordarg_inside_array)
+		goto new_prim_scan;
+
+	/*
 	 * Postcondition array state assertion (for still-unsatisfied tuples).
 	 *
 	 * By here we have established that the scan's required arrays (scan must
@@ -2812,7 +2862,8 @@ new_prim_scan:
 	 * each time.  This misbehavior would otherwise be possible during scans
 	 * that never quite manage to "clear the first page finaltup hurdle".
 	 */
-	if (!pstate->firstpage || pstate->nskipadvances > NSKIPADVANCES_THRESHOLD)
+	if (!pstate->ordarg_inside_array &&
+		(!pstate->firstpage || pstate->nskipadvances > NSKIPADVANCES_THRESHOLD))
 	{
 		/* Schedule a recheck once on the next (or previous) page */
 		so->scanBehind = true;
@@ -2886,7 +2937,7 @@ _bt_advance_array_keys_increment(IndexScanDesc scan, ScanDirection dir,
 		BTArrayKeyInfo *array = &so->arrayKeys[i];
 		ScanKey		skey = &so->keyData[array->scan_key];
 
-		if (array->num_elems == -1)
+		if (skip_array_set && array->num_elems == -1)
 			*skip_array_set = true;
 
 		if (ScanDirectionIsForward(dir))
@@ -2930,6 +2981,40 @@ _bt_advance_array_keys_increment(IndexScanDesc scan, ScanDirection dir,
 	_bt_start_array_keys(scan, -dir);
 
 	return false;
+}
+
+/*
+ * _bt_force_advance_array_keys() -- Forcedly advance to next set of array elements
+ *
+ * Unconditionally advances the array keys by a single increment and shedules
+ * new primscan on success. When there are multiple array keys this can
+ * roll over from the lowest order array to higher order arrays.
+ */
+static void
+_bt_force_advance_array_keys(IndexScanDesc scan, BTReadPageState *pstate)
+{
+
+	BTScanOpaque so = (BTScanOpaque) scan->opaque;
+	BTScanPos	currPos = &so->state.currPos;
+
+	if (so->needPrimScan)
+		return;
+
+	pstate->continuescan = false;
+	so->needPrimScan = _bt_advance_array_keys_increment(scan, currPos->dir, NULL);
+
+	if (scan->parallel_scan)
+	{
+		if (so->needPrimScan)
+			_bt_parallel_primscan_schedule(scan, currPos->currPage);
+		else
+		{
+			if (!BufferIsValid(currPos->buf))
+				_bt_parallel_done(scan, &so->state);
+		}
+	}
+
+	return;
 }
 
 /*
@@ -3217,7 +3302,8 @@ _bt_array_set_low_or_high(Relation rel, ScanKey skey, BTArrayKeyInfo *array,
 
 		Assert(!(skey->sk_flags & SK_BT_SKIP));
 
-		if (!low_not_high)
+		if (!low_not_high &&
+			array->ord_arg_loc != WITHIN_ORDER_ARG_LOCATION)
 			set_elem = array->num_elems - 1;
 
 		/*
@@ -3330,73 +3416,6 @@ _bt_skiparray_set_isnull(Relation rel, ScanKey skey, BTArrayKeyInfo *array)
 }
 
 /*
- * _bt_compare_array_skey() -- apply array comparison function
- *
- * Compares caller's tuple attribute value to a scan key/array element.
- * Helper function used during binary searches of SK_SEARCHARRAY arrays.
- *
- *		This routine returns:
- *			<0 if tupdatum < arrdatum;
- *			 0 if tupdatum == arrdatum;
- *			>0 if tupdatum > arrdatum.
- *
- * This is essentially the same interface as _bt_compare: both functions
- * compare the value that they're searching for to a binary search pivot.
- * However, unlike _bt_compare, this function's "tuple argument" comes first,
- * while its "array/scankey argument" comes second.
-*/
-static inline int32
-_bt_compare_array_skey(FmgrInfo *orderproc,
-					   Datum tupdatum, bool tupnull,
-					   Datum arrdatum, ScanKey cur)
-{
-	int32		result = 0;
-
-	Assert(cur->sk_strategy == BTEqualStrategyNumber);
-	Assert(!(cur->sk_flags & (SK_BT_MINVAL | SK_BT_MAXVAL)));
-
-	if (tupnull)				/* NULL tupdatum */
-	{
-		if (cur->sk_flags & SK_ISNULL)
-			result = 0;			/* NULL "=" NULL */
-		else if (cur->sk_flags & SK_BT_NULLS_FIRST)
-			result = -1;		/* NULL "<" NOT_NULL */
-		else
-			result = 1;			/* NULL ">" NOT_NULL */
-	}
-	else if (cur->sk_flags & SK_ISNULL) /* NOT_NULL tupdatum, NULL arrdatum */
-	{
-		if (cur->sk_flags & SK_BT_NULLS_FIRST)
-			result = 1;			/* NOT_NULL ">" NULL */
-		else
-			result = -1;		/* NOT_NULL "<" NULL */
-	}
-	else
-	{
-		/*
-		 * Like _bt_compare, we need to be careful of cross-type comparisons,
-		 * so the left value has to be the value that came from an index tuple
-		 */
-		result = DatumGetInt32(FunctionCall2Coll(orderproc, cur->sk_collation,
-												 tupdatum, arrdatum));
-
-		/*
-		 * We flip the sign by following the obvious rule: flip whenever the
-		 * column is a DESC column.
-		 *
-		 * _bt_compare does it the wrong way around (flip when *ASC*) in order
-		 * to compensate for passing its orderproc arguments backwards.  We
-		 * don't need to play these games because we find it natural to pass
-		 * tupdatum as the left value (and arrdatum as the right value).
-		 */
-		if (cur->sk_flags & SK_BT_DESC)
-			INVERT_COMPARE_RESULT(result);
-	}
-
-	return result;
-}
-
-/*
  * _bt_binsrch_array_skey() -- Binary search for next matching array key
  *
  * Returns an index to the first array element >= caller's tupdatum argument.
@@ -3475,6 +3494,14 @@ _bt_binsrch_array_skey(FmgrInfo *orderproc,
 					*set_elem_result = result;
 					return low_elem;
 				}
+
+				if (array->ord_arg_loc == WITHIN_ORDER_ARG_LOCATION)
+				{
+					/* Caller needs to perform "beyond end" array advancement */
+					*set_elem_result = 1;
+					return array->cur_elem;
+				}
+
 				mid_elem = low_elem;
 				low_elem++;		/* this cur_elem exhausted, too */
 			}
@@ -3503,6 +3530,14 @@ _bt_binsrch_array_skey(FmgrInfo *orderproc,
 					*set_elem_result = result;
 					return high_elem;
 				}
+
+				if (array->ord_arg_loc == WITHIN_ORDER_ARG_LOCATION)
+				{
+					/* Caller needs to perform "beyond end" array advancement */
+					*set_elem_result = -1;
+					return array->cur_elem;
+				}
+
 				mid_elem = high_elem;
 				high_elem--;	/* this cur_elem exhausted, too */
 			}

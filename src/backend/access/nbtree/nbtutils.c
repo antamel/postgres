@@ -1273,8 +1273,8 @@ _bt_init_knn_start_keys(IndexScanDesc scan, ScanKey *startKeys, ScanKey bufKey)
 	ScanKey		ord = scan->orderByData;
 	int			indopt = scan->indexRelation->rd_indoption[ord->sk_attno - 1];
 	int			flags = (indopt << SK_BT_INDOPTION_SHIFT) |
-	SK_ORDER_BY |
-	SK_SEARCHNULL;				/* only for invalid procedure oid, see assert
+		SK_ORDER_BY |
+		SK_SEARCHNULL;			/* only for invalid procedure oid, see assert
 								 * in ScanKeyEntryInitialize() */
 	int			keysCount = 0;
 
