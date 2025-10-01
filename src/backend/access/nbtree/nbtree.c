@@ -67,11 +67,14 @@ typedef enum
 typedef struct BTParallelScanDescData
 {
 	BlockNumber btps_forwardNextScanPage;	/* next page to be scanned */
-	BlockNumber btps_forwardLastCurrPage;	/* page whose sibling link was copied into
-									 * btps_forwardNextScanPage */
-	BlockNumber btps_backwardNextScanPage;	/* secondary kNN next page to be scanned */
-	BlockNumber btps_backwardLastCurrPage;	/* secondary kNN page whose sibling link was copied into
-									 * btps_backwardNextScanPage */
+	BlockNumber btps_forwardLastCurrPage;	/* page whose sibling link was
+											 * copied into
+											 * btps_forwardNextScanPage */
+	BlockNumber btps_backwardNextScanPage;	/* secondary kNN next page to be
+											 * scanned */
+	BlockNumber btps_backwardLastCurrPage;	/* secondary kNN page whose
+											 * sibling link was copied into
+											 * btps_backwardNextScanPage */
 	BTPS_State	btps_pageStatus;	/* indicates whether next page is
 									 * available for scan. see above for
 									 * possible states of parallel scan. */
@@ -481,9 +484,9 @@ btrescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 	 * Note: state->dropPin should never change across rescans.
 	 */
 	state->dropPin = (!scan->xs_want_itup &&
-				   IsMVCCSnapshot(scan->xs_snapshot) &&
-				   RelationNeedsWAL(scan->indexRelation) &&
-				   scan->heapRelation != NULL);
+					  IsMVCCSnapshot(scan->xs_snapshot) &&
+					  RelationNeedsWAL(scan->indexRelation) &&
+					  scan->heapRelation != NULL);
 
 	so->needPrimScan = false;
 	so->scanBehind = false;
@@ -919,7 +922,9 @@ _bt_parallel_seize(IndexScanDesc scan, BTScanState state,
 	ParallelIndexScanDesc parallel_scan = scan->parallel_scan;
 	BTParallelScanDesc btscan;
 	BlockNumber *nextScanPage,
-				*lastCurrPage;
+				*lastCurrPage,
+				*otherNextScanPage;
+	bool		knnScan = so->useBidirectionalKnnScan;
 
 	*next_scan_page = InvalidBlockNumber;
 	*last_curr_page = InvalidBlockNumber;
@@ -956,13 +961,20 @@ _bt_parallel_seize(IndexScanDesc scan, BTScanState state,
 	btscan = (BTParallelScanDesc) OffsetToPointer(parallel_scan,
 												  parallel_scan->ps_offset_am);
 
-	nextScanPage = state == so->backwardState ?
-		&btscan->btps_backwardNextScanPage :
-		&btscan->btps_forwardNextScanPage;
+	if (state != so->backwardState)
+	{
+		nextScanPage = &btscan->btps_forwardNextScanPage;
+		otherNextScanPage = &btscan->btps_backwardNextScanPage;
+	}
+	else
+	{
+		nextScanPage = &btscan->btps_backwardNextScanPage;
+		otherNextScanPage = &btscan->btps_forwardNextScanPage;
+	}
 
 	lastCurrPage = state == so->backwardState ?
-		&btscan->btps_backwardLastCurrPage :
-		&btscan->btps_forwardLastCurrPage;
+				   &btscan->btps_backwardLastCurrPage :
+				   &btscan->btps_forwardLastCurrPage;
 
 	while (1)
 	{
@@ -976,9 +988,11 @@ _bt_parallel_seize(IndexScanDesc scan, BTScanState state,
 		else if (btscan->btps_pageStatus == BTPARALLEL_IDLE &&
 				 *nextScanPage == P_NONE)
 		{
-			/* End this parallel index scan */
 			status = false;
-			endscan = true;
+
+			/* End this parallel index scan only if both knn scans have finished */
+			if (!knnScan || *otherNextScanPage == P_NONE)
+				endscan = true;
 		}
 		else if (btscan->btps_pageStatus == BTPARALLEL_NEED_PRIMSCAN)
 		{
@@ -1022,6 +1036,28 @@ _bt_parallel_seize(IndexScanDesc scan, BTScanState state,
 			*next_scan_page = *nextScanPage;
 			*last_curr_page = *lastCurrPage;
 			exit_loop = true;
+
+			/*
+			 * Catch up possibly lagging keys in a parallel scan. This is not
+			 * necessary if the next element of the array key is further down
+			 * the scanning direction since here we are obviously beyond along
+			 * the index from the last array keys advancing point and the very
+			 * first indextuple cannot satisfy any scankey conditions. So the
+			 * array keys will be guaranteed advanced. But in the case of
+			 * distance ordering this may not be the case because the next
+			 * array element may be in the opposite direction to the previous
+			 * primscan.
+			 */
+			for (int i = 0; i < so->numArrayKeys; i++)
+			{
+				BTArrayKeyInfo *array = &so->arrayKeys[i];
+
+				if (array->ord_arg_loc == WITHIN_ORDER_ARG_LOCATION)
+				{
+					_bt_parallel_restore_arrays(rel, btscan, so);
+					break;
+				}
+			}
 		}
 		LWLockRelease(&btscan->btps_lock);
 		if (exit_loop || !status)
@@ -1087,13 +1123,12 @@ _bt_parallel_release(IndexScanDesc scan, BTScanState state,
 	}
 
 	lastCurrPage = state == so->backwardState ?
-				   &btscan->btps_backwardLastCurrPage :
-				   &btscan->btps_forwardLastCurrPage;
+		&btscan->btps_backwardLastCurrPage :
+		&btscan->btps_forwardLastCurrPage;
 
 	LWLockAcquire(&btscan->btps_lock, LW_EXCLUSIVE);
 	*scanPage = next_scan_page;
 	*lastCurrPage = curr_page;
-	btscan->btps_pageStatus = BTPARALLEL_IDLE;
 	/* switch to idle state only if both KNN pages are initialized */
 	if (!knnScan || *otherScanPage != InvalidBlockNumber)
 	{
@@ -1109,40 +1144,44 @@ _bt_parallel_release(IndexScanDesc scan, BTScanState state,
 /*
  * _bt_parallel_done() -- Mark the parallel scan as complete.
  *
- * When there are no pages left to scan, this function should be called to
- * notify other workers.  Otherwise, they might wait forever for the scan to
- * advance to the next page.
+ * When there are no pages left to scan in some direction, this function
+ * should be called to notify other workers.  Otherwise, they might wait
+ * forever for the scan to advance to the next page.
+ * In case of knn bidirectional scan this function may do nothing and return
+ * false if the scan was seized by some worker in the opposite direction
+ * at that moment. Otherwise, it notifies other workers and returns true.
  */
-void
+bool
 _bt_parallel_done(IndexScanDesc scan, BTScanState state)
 {
 	BTScanOpaque so = (BTScanOpaque) scan->opaque;
 	ParallelIndexScanDesc parallel_scan = scan->parallel_scan;
 	BTParallelScanDesc btscan;
-	BlockNumber *nextScanPage;
+	BlockNumber *otherScanPage;
 	bool		status_changed = false;
+	bool		res = true;
 	bool		knnScan = so->useBidirectionalKnnScan;
 
 	Assert(!BTScanPosIsValid(state->currPos));
 
 	/* Do nothing, for non-parallel scans */
 	if (parallel_scan == NULL)
-		return;
+		return res;
 
 	/*
 	 * Should not mark parallel scan done when there's still a pending
 	 * primitive index scan
 	 */
 	if (so->needPrimScan)
-		return;
+		return res;
 
 	btscan = (BTParallelScanDesc) OffsetToPointer(parallel_scan,
 												  parallel_scan->ps_offset_am);
 
 	Assert(state);
-	nextScanPage = state == so->backwardState ?
-							&btscan->btps_forwardNextScanPage :
-							&btscan->btps_backwardNextScanPage;
+	otherScanPage = state == so->backwardState ?
+		&btscan->btps_forwardNextScanPage :
+		&btscan->btps_backwardNextScanPage;
 
 	/*
 	 * Mark the parallel scan as done, unless some other process did so
@@ -1153,8 +1192,14 @@ _bt_parallel_done(IndexScanDesc scan, BTScanState state)
 
 	status_changed = true;
 
+	if (btscan->btps_pageStatus == BTPARALLEL_ADVANCING)
+	{
+		/* we can't do anything with this scan as some worker seized it */
+		res = false;
+		status_changed = false;
+	}
 	/* switch to "done" state only if both KNN scans are done */
-	if (!knnScan || *nextScanPage == P_NONE)
+	else if (!knnScan || *otherScanPage == P_NONE)
 	{
 		if (btscan->btps_pageStatus == BTPARALLEL_DONE)
 			status_changed = false;
@@ -1162,7 +1207,7 @@ _bt_parallel_done(IndexScanDesc scan, BTScanState state)
 		btscan->btps_pageStatus = BTPARALLEL_DONE;
 	}
 	/* else switch to "idle" state only if both KNN scans are initialized */
-	else if (*nextScanPage != InvalidBlockNumber)
+	else if (*otherScanPage != InvalidBlockNumber)
 		btscan->btps_pageStatus = BTPARALLEL_IDLE;
 	else
 		status_changed = false;
@@ -1172,6 +1217,8 @@ _bt_parallel_done(IndexScanDesc scan, BTScanState state)
 	/* wake up all the workers associated with this parallel scan */
 	if (status_changed)
 		ConditionVariableBroadcast(&btscan->btps_cv);
+
+	return res;
 }
 
 /*
@@ -1191,7 +1238,7 @@ _bt_parallel_primscan_schedule(IndexScanDesc scan, BlockNumber curr_page)
 	ParallelIndexScanDesc parallel_scan = scan->parallel_scan;
 	BTParallelScanDesc btscan;
 	BlockNumber *nextScanPage,
-				*lastCurrPage;
+			   *lastCurrPage;
 
 	Assert(so->numArrayKeys);
 
