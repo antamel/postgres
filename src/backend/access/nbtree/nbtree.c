@@ -232,7 +232,6 @@ btgettuple(IndexScanDesc scan, ScanDirection dir)
 {
 	BTScanOpaque so = (BTScanOpaque) scan->opaque;
 	BTScanState state = &so->state;
-	ScanDirection arraydir = dir;
 	bool		res;
 
 	if (scan->numberOfOrderBys > 0 && !ScanDirectionIsForward(dir))
@@ -289,7 +288,7 @@ btgettuple(IndexScanDesc scan, ScanDirection dir)
 		if (res)
 			break;
 		/* ... otherwise see if we need another primitive index scan */
-	} while (so->numArrayKeys && _bt_start_prim_scan(scan, arraydir));
+	} while (so->numArrayKeys && _bt_start_prim_scan(scan, dir));
 
 	return res;
 }
@@ -999,6 +998,34 @@ _bt_parallel_seize(IndexScanDesc scan, BTScanState state,
 			*next_scan_page = *nextScanPage;
 			*last_curr_page = *lastCurrPage;
 			exit_loop = true;
+
+			/*
+			 * Catch up possibly lagging keys in a parallel scan.
+			 * This is not necessary if the next element of the array key
+			 * is further down the scanning direction since here we are
+			 * obviously beyond along the index from the last array keys
+			 * advancing point and the very first indextuple cannot
+			 * satisfy any scankey conditions. So the array keys
+			 * will be guaranteed advanced.
+			 * But in the case of distance ordering this may not be the case
+			 * because the next array element may be in the opposite
+			 * direction to the previous primscan.
+			 */
+			for (int i = 0; i < so->numArrayKeys; i++)
+			{
+				BTArrayKeyInfo *array = &so->arrayKeys[i];
+
+				if (array->ord_arg_loc == WITHIN_ORDER_ARG_LOCATION)
+				{
+					ScanKey		skey = &so->keyData[array->scan_key];
+
+					if (array->cur_elem < btscan->btps_arrElems[i])
+					{
+						array->cur_elem = btscan->btps_arrElems[i];
+						skey->sk_argument = array->elem_values[array->cur_elem];
+					}
+				}
+			}
 		}
 		LWLockRelease(&btscan->btps_lock);
 		if (exit_loop || !status)

@@ -1032,12 +1032,29 @@ typedef BTScanPosData *BTScanPos;
 		(scanpos).currPage = InvalidBlockNumber; \
 	} while (0)
 
+/*
+ * When ordering by distance, there are three possible cases:
+ * case A: ordering argument is less or equal to the minarray element;
+ * case B: ordering argument is greater or equal to the max element;
+ * case C: ordering argument is within the array bounds.
+ * This enum defines these three cases.
+ */
+
+ typedef enum OrderArgLocation
+{
+	UNKNOWN_ORDER_ARG_LOCATION = 0,
+	LEFT_ORDER_ARG_LOCATION,	/* go forward */
+	WITHIN_ORDER_ARG_LOCATION,  /* iterate by elements */
+	RIGHT_ORDER_ARG_LOCATION,   /* go backward */
+} OrderArgLocation;
+
 /* We need one of these for each equality-type SK_SEARCHARRAY scan key */
 typedef struct BTArrayKeyInfo
 {
 	/* fields set for both kinds of array (SAOP arrays and skip arrays) */
 	int			scan_key;		/* index of associated key in keyData */
 	int			num_elems;		/* number of elems (-1 means skip array) */
+	OrderArgLocation  	ord_arg_loc; 	/* location of the ordering argument */
 
 	/* fields set for ScalarArrayOpExpr arrays only */
 	Datum	   *elem_values;	/* array of num_elems Datums */
@@ -1136,6 +1153,7 @@ typedef struct BTReadPageState
 	bool		firstpage;		/* page is first for primitive scan? */
 	bool		forcenonrequired;	/* treat all keys as nonrequired? */
 	int			startikey;		/* start comparisons from this scan key */
+	bool		ordArgInsideArray;
 
 	/* Per-tuple input parameters, set by _bt_readpage for _bt_checkkeys */
 	OffsetNumber offnum;		/* current tuple's page offset number */
@@ -1173,6 +1191,73 @@ typedef struct BTReadPageState
 #define SK_BT_INDOPTION_SHIFT  24	/* must clear the above bits */
 #define SK_BT_DESC			(INDOPTION_DESC << SK_BT_INDOPTION_SHIFT)
 #define SK_BT_NULLS_FIRST	(INDOPTION_NULLS_FIRST << SK_BT_INDOPTION_SHIFT)
+
+/*
+ * _bt_compare_array_skey() -- apply array comparison function
+ *
+ * Compares caller's tuple attribute value to a scan key/array element.
+ * Helper function used during binary searches of SK_SEARCHARRAY arrays.
+ *
+ *		This routine returns:
+ *			<0 if tupdatum < arrdatum;
+ *			 0 if tupdatum == arrdatum;
+ *			>0 if tupdatum > arrdatum.
+ *
+ * This is essentially the same interface as _bt_compare: both functions
+ * compare the value that they're searching for to a binary search pivot.
+ * However, unlike _bt_compare, this function's "tuple argument" comes first,
+ * while its "array/scankey argument" comes second.
+*/
+static inline int32
+_bt_compare_array_skey(FmgrInfo *orderproc,
+					   Datum tupdatum, bool tupnull,
+					   Datum arrdatum, ScanKey cur)
+{
+	int32		result = 0;
+
+	Assert(cur->sk_strategy == BTEqualStrategyNumber);
+	Assert(!(cur->sk_flags & (SK_BT_MINVAL | SK_BT_MAXVAL)));
+
+	if (tupnull)				/* NULL tupdatum */
+	{
+		if (cur->sk_flags & SK_ISNULL)
+			result = 0;			/* NULL "=" NULL */
+		else if (cur->sk_flags & SK_BT_NULLS_FIRST)
+			result = -1;		/* NULL "<" NOT_NULL */
+		else
+			result = 1;			/* NULL ">" NOT_NULL */
+	}
+	else if (cur->sk_flags & SK_ISNULL) /* NOT_NULL tupdatum, NULL arrdatum */
+	{
+		if (cur->sk_flags & SK_BT_NULLS_FIRST)
+			result = 1;			/* NOT_NULL ">" NULL */
+		else
+			result = -1;		/* NOT_NULL "<" NULL */
+	}
+	else
+	{
+		/*
+		 * Like _bt_compare, we need to be careful of cross-type comparisons,
+		 * so the left value has to be the value that came from an index tuple
+		 */
+		result = DatumGetInt32(FunctionCall2Coll(orderproc, cur->sk_collation,
+												 tupdatum, arrdatum));
+
+		/*
+		 * We flip the sign by following the obvious rule: flip whenever the
+		 * column is a DESC column.
+		 *
+		 * _bt_compare does it the wrong way around (flip when *ASC*) in order
+		 * to compensate for passing its orderproc arguments backwards.  We
+		 * don't need to play these games because we find it natural to pass
+		 * tupdatum as the left value (and arrdatum as the right value).
+		 */
+		if (cur->sk_flags & SK_BT_DESC)
+			INVERT_COMPARE_RESULT(result);
+	}
+
+	return result;
+}
 
 typedef struct BTOptions
 {
@@ -1357,6 +1442,7 @@ extern bool _bt_checkkeys(IndexScanDesc scan, BTReadPageState *pstate, bool arra
 extern bool _bt_scanbehind_checkkeys(IndexScanDesc scan, ScanDirection dir,
 								  IndexTuple finaltup);
 extern void _bt_set_startikey(IndexScanDesc scan, BTReadPageState *pstate);
+extern void _bt_force_advance_array_keys(IndexScanDesc scan, BTReadPageState *pstate);
 extern void _bt_killitems(BTScanState state, Relation indexRelation);
 extern BTCycleId _bt_vacuum_cycleid(Relation rel);
 extern BTCycleId _bt_start_vacuum(Relation rel);

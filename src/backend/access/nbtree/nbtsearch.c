@@ -1025,8 +1025,8 @@ _bt_init_knn_scan(IndexScanDesc scan, OffsetNumber offnum)
 	 * will save the next page number in BTParallelScanDesc.
 	 */
 	left = _bt_readpage(scan, lstate, ldir, loffnum, true);
-	right = _bt_readfirstpage(scan, rstate, rdir, roffnum, NULL);
-	left = _bt_readfirstpage(scan, lstate, ldir, loffnum, &left);
+	right = _bt_readfirstpage(scan, rstate, roffnum, rdir, NULL);
+	left = _bt_readfirstpage(scan, lstate, loffnum, ldir, &left);
 
 	return _bt_start_knn_scan(scan, left, right);
 }
@@ -1931,13 +1931,29 @@ _bt_readpage(IndexScanDesc scan, BTScanState state, ScanDirection dir, OffsetNum
 	pstate.rechecks = 0;
 	pstate.targetdistance = 0;
 	pstate.nskipadvances = 0;
+	pstate.ordArgInsideArray = false;
+
+	/* Check if it is a type C scan. See the comment to the enum OrderArgLocation */
+	for (int i = 0; i < so->numArrayKeys; i++)
+	{
+		BTArrayKeyInfo *array = &so->arrayKeys[i];
+		if (array->ord_arg_loc == WITHIN_ORDER_ARG_LOCATION)
+		{
+			pstate.ordArgInsideArray = true;
+			break;
+		}
+	}
 
 	if (ScanDirectionIsForward(dir))
 	{
 		/* SK_SEARCHARRAY forward scans must provide high key up front */
 		if (arrayKeys)
 		{
-			if (!P_RIGHTMOST(opaque))
+			/*
+			 * In the case C of distance ordering it must also be provided for
+			 * the final index page as forced primscan may occur there.
+			 */
+			if (!P_RIGHTMOST(opaque) || pstate.ordArgInsideArray)
 			{
 				ItemId		iid = PageGetItemId(page, P_HIKEY);
 
@@ -2070,6 +2086,18 @@ _bt_readpage(IndexScanDesc scan, BTScanState state, ScanDirection dir, OffsetNum
 			pstate.startikey = 0;	/* _bt_set_startikey ignores HIKEY */
 			_bt_checkkeys(scan, &pstate, arrayKeys, itup, truncatt);
 		}
+
+		/*
+		 * Consider advancing the array keys in the C case of distance ordering
+		 * (see the comment to the enum OrderArgLocation).
+		 * On scanning forward, when the scan reaches the very last tuple,
+		 * a situation may arise where there may be some unpassed array elements
+		 * remaining, the first of which is in the opposite direction
+		 * to the scan just completed, so another primitive scan is required.
+		 */
+
+		if (pstate.ordArgInsideArray && pstate.continuescan && P_RIGHTMOST(opaque))
+			_bt_force_advance_array_keys(scan, &pstate);
 
 		if (!pstate.continuescan)
 			pos->moreRight = false;
@@ -2228,6 +2256,15 @@ _bt_readpage(IndexScanDesc scan, BTScanState state, ScanDirection dir, OffsetNum
 					}
 				}
 			}
+
+			/*
+			 * See the comment above for a similar case when scanning forward.
+			 * But for the very first tuple in the index.
+			 */
+
+			if (pstate.ordArgInsideArray && pstate.continuescan && P_LEFTMOST(opaque))
+				_bt_force_advance_array_keys(scan, &pstate);
+
 			/* When !continuescan, there can't be any more matches, so stop */
 			if (!pstate.continuescan)
 				break;
