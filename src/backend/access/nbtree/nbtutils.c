@@ -28,9 +28,6 @@
 #define LOOK_AHEAD_DEFAULT_DISTANCE 	5
 #define NSKIPADVANCES_THRESHOLD			3
 
-static inline int32 _bt_compare_array_skey(FmgrInfo *orderproc,
-										   Datum tupdatum, bool tupnull,
-										   Datum arrdatum, ScanKey cur);
 static void _bt_binsrch_skiparray_skey(bool cur_elem_trig, ScanDirection dir,
 									   Datum tupdatum, bool tupnull,
 									   BTArrayKeyInfo *array, ScanKey cur,
@@ -210,7 +207,7 @@ _bt_freestack(BTStack stack)
  * However, unlike _bt_compare, this function's "tuple argument" comes first,
  * while its "array/scankey argument" comes second.
 */
-static inline int32
+inline int32
 _bt_compare_array_skey(FmgrInfo *orderproc,
 					   Datum tupdatum, bool tupnull,
 					   Datum arrdatum, ScanKey cur)
@@ -340,6 +337,14 @@ _bt_binsrch_array_skey(FmgrInfo *orderproc,
 					*set_elem_result = result;
 					return low_elem;
 				}
+
+				if (array->ord_arg_loc == WITHIN_ORDER_ARG_LOCATION)
+				{
+					/* Caller needs to perform "beyond end" array advancement */
+					*set_elem_result = 1;
+					return array->cur_elem;
+				}
+
 				mid_elem = low_elem;
 				low_elem++;		/* this cur_elem exhausted, too */
 			}
@@ -368,6 +373,14 @@ _bt_binsrch_array_skey(FmgrInfo *orderproc,
 					*set_elem_result = result;
 					return high_elem;
 				}
+
+				if (array->ord_arg_loc == WITHIN_ORDER_ARG_LOCATION)
+				{
+					/* Caller needs to perform "beyond end" array advancement */
+					*set_elem_result = -1;
+					return array->cur_elem;
+				}
+
 				mid_elem = high_elem;
 				high_elem--;	/* this cur_elem exhausted, too */
 			}
@@ -646,7 +659,8 @@ _bt_array_set_low_or_high(Relation rel, ScanKey skey, BTArrayKeyInfo *array,
 
 		Assert(!(skey->sk_flags & SK_BT_SKIP));
 
-		if (!low_not_high)
+		if (!low_not_high &&
+			array->ord_arg_loc != WITHIN_ORDER_ARG_LOCATION)
 			set_elem = array->num_elems - 1;
 
 		/*
@@ -986,7 +1000,7 @@ _bt_advance_array_keys_increment(IndexScanDesc scan, ScanDirection dir,
 		BTArrayKeyInfo *array = &so->arrayKeys[i];
 		ScanKey		skey = &so->keyData[array->scan_key];
 
-		if (array->num_elems == -1)
+		if (skip_array_set && array->num_elems == -1)
 			*skip_array_set = true;
 
 		if (ScanDirectionIsForward(dir))
@@ -1030,6 +1044,33 @@ _bt_advance_array_keys_increment(IndexScanDesc scan, ScanDirection dir,
 	_bt_start_array_keys(scan, -dir);
 
 	return false;
+}
+
+void
+_bt_force_advance_array_keys(IndexScanDesc scan, BTReadPageState *pstate)
+{
+
+	BTScanOpaque so = (BTScanOpaque) scan->opaque;
+	BTScanPos	currPos = &so->state.currPos;
+
+	if (so->needPrimScan)
+		return;
+
+	pstate->continuescan = false;
+	so->needPrimScan = _bt_advance_array_keys_increment(scan, currPos->dir, NULL);
+
+	if (scan->parallel_scan)
+	{
+		if (so->needPrimScan)
+			_bt_parallel_primscan_schedule(scan, currPos->currPage);
+		else
+		{
+			if (!BufferIsValid(currPos->buf))
+				_bt_parallel_done(scan, &so->state);
+		}
+	}
+
+	return;
 }
 
 /*
@@ -1824,6 +1865,14 @@ _bt_advance_array_keys(IndexScanDesc scan, BTReadPageState *pstate,
 	}
 
 	/*
+	 * For case C of distance ordering we use old behaviour: a separate
+	 * primscan for every SAOP element. Future optimization is possible here
+	 * although.
+	 */
+	if (pstate->ordarg_inside_array)
+		goto new_prim_scan;
+
+	/*
 	 * Postcondition array state assertion (for still-unsatisfied tuples).
 	 *
 	 * By here we have established that the scan's required arrays (scan must
@@ -2015,7 +2064,8 @@ new_prim_scan:
 	 * each time.  This misbehavior would otherwise be possible during scans
 	 * that never quite manage to "clear the first page finaltup hurdle".
 	 */
-	if (!pstate->firstpage || pstate->nskipadvances > NSKIPADVANCES_THRESHOLD)
+	if (!pstate->ordarg_inside_array &&
+		(!pstate->firstpage || pstate->nskipadvances > NSKIPADVANCES_THRESHOLD))
 	{
 		/* Schedule a recheck once on the next (or previous) page */
 		so->scanBehind = true;
@@ -4357,8 +4407,8 @@ _bt_init_knn_start_keys(IndexScanDesc scan, ScanKey *startKeys, ScanKey bufKeys)
 	ScanKey		ord = scan->orderByData;
 	int			indopt = scan->indexRelation->rd_indoption[ord->sk_attno - 1];
 	int			flags = (indopt << SK_BT_INDOPTION_SHIFT) |
-	SK_ORDER_BY |
-	SK_SEARCHNULL;				/* only for invalid procedure oid, see assert
+		SK_ORDER_BY |
+		SK_SEARCHNULL;			/* only for invalid procedure oid, see assert
 								 * in ScanKeyEntryInitialize() */
 	int			keysCount = 0;
 
