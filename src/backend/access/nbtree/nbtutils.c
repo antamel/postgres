@@ -36,13 +36,24 @@
 
 typedef struct BTSortArrayContext
 {
-	FmgrInfo   *sortproc;
-	FmgrInfo	distflinfo;
-	FmgrInfo	distcmpflinfo;
-	ScanKey		distkey;
-	Oid			collation;
+	FmgrInfo    *sortproc; /* ORDER proc for sorting SAOP array itself or by the results of distproc */
+	FmgrInfo    *distproc; /* to get distance from array elem to ordering key */
+	FmgrInfo    *cmpproc; /* ORDER proc to compare array elems with each other */
+	FmgrInfo    *cmpdistargproc; /* ORDER proc to compare array elem with ordering key arg */
+	Datum 		distarg; /* sk_argument of the distance order key */
+	Oid			collation; /* from equality SAOP key */
+	Oid			distCollation; /* from distance ordering key */
 	bool		reverse;
+	bool		orderByDistance; /* true if needed for array elements */
 } BTSortArrayContext;
+
+/*
+ * Function for sorting array elements.
+ * Either it can be used to compare array elements with each other,
+ * or to compare the return values ​​of a function for distance
+ * calculation between array elements and the ordering key argument.
+ */
+typedef int (*BTSortArrayComparator)(const void *, const void *, void *);
 
 typedef struct BTScanKeyPreproc
 {
@@ -51,17 +62,18 @@ typedef struct BTScanKeyPreproc
 	int			arrayidx;
 } BTScanKeyPreproc;
 
-static void _bt_setup_array_cmp(IndexScanDesc scan, ScanKey skey, Oid elemtype,
-								FmgrInfo *orderproc, FmgrInfo **sortprocp);
+static BTSortArrayComparator _bt_setup_array_cmp(IndexScanDesc scan,
+												 ScanKey skey,
+												 Oid elemtype,
+												 FmgrInfo *orderproc,
+												 BTSortArrayContext *cxt);
 static Datum _bt_find_extreme_element(IndexScanDesc scan, ScanKey skey,
 									  Oid elemtype, StrategyNumber strat,
 									  Datum *elems, int nelems);
-static int	_bt_sort_array_elements(IndexScanDesc scan, ScanKey skey, FmgrInfo *sortproc,
-									bool reverse, Datum *elems, int nelems);
 static bool _bt_merge_arrays(IndexScanDesc scan, ScanKey skey,
-							 FmgrInfo *sortproc, bool reverse,
-							 Oid origelemtype, Oid nextelemtype,
-							 Datum *elems_orig, int *nelems_orig,
+							 BTSortArrayContext *next_cxt,
+							 Oid origelemtype, Oid nextelemtype, Oid origdistproc,
+							 Datum **elems_orig, int *nelems_orig,
 							 Datum *elems_next, int nelems_next);
 static bool _bt_compare_array_scankey_args(IndexScanDesc scan,
 										   ScanKey arraysk, ScanKey skey,
@@ -70,6 +82,11 @@ static bool _bt_compare_array_scankey_args(IndexScanDesc scan,
 static ScanKey _bt_preprocess_array_keys(IndexScanDesc scan, int *new_numberOfKeys);
 static void _bt_preprocess_array_keys_final(IndexScanDesc scan, int *keyDataMap);
 static int	_bt_compare_array_elements(const void *a, const void *b, void *arg);
+static int	_bt_compare_array_element_with_dist_arg(const void *n, void *arg);
+static int	_bt_compare_array_elements_by_distance(const void *a, const void *b,
+												   void *arg);
+static int  _bt_cross_compare_array_elements_by_distance(const void *a, const void *b,
+														 void *arga, void *argb);
 static inline int32 _bt_compare_array_skey(FmgrInfo *orderproc,
 										   Datum tupdatum, bool tupnull,
 										   Datum arrdatum, ScanKey cur);
@@ -288,6 +305,8 @@ _bt_preprocess_array_keys(IndexScanDesc scan, int *new_numberOfKeys)
 	int			origarrayatt = InvalidAttrNumber,
 				origarraykey = -1;
 	Oid			origelemtype = InvalidOid;
+	Oid			origdistproc = InvalidOid;
+	bool		origreverse = false;
 	ScanKey		cur;
 	MemoryContext oldContext;
 	ScanKey		arrayKeyData;	/* modified copy of scan->keyData */
@@ -342,10 +361,11 @@ _bt_preprocess_array_keys(IndexScanDesc scan, int *new_numberOfKeys)
 	numArrayKeys = 0;
 	for (int input_ikey = 0; input_ikey < numberOfKeys; input_ikey++)
 	{
-		FmgrInfo	sortproc;
-		FmgrInfo   *sortprocp = &sortproc;
+		FmgrInfo	sortproc,
+					distproc,
+					cmpproc,
+					cmpdistargproc;
 		Oid			elemtype;
-		bool		reverse;
 		ArrayType  *arrayval;
 		int16		elmlen;
 		bool		elmbyval;
@@ -355,6 +375,10 @@ _bt_preprocess_array_keys(IndexScanDesc scan, int *new_numberOfKeys)
 		bool	   *elem_nulls;
 		int			num_nonnulls;
 		int			j;
+		BTSortArrayContext cxt;
+		BTSortArrayComparator sort_array_cmp;
+		bool need_reverse = false;
+		OrderArgLocation order_arg_location = UNKNOWN_ORDER_ARG_LOCATION;
 
 		/*
 		 * Provisionally copy scan key into arrayKeyData[] array we'll return
@@ -368,6 +392,10 @@ _bt_preprocess_array_keys(IndexScanDesc scan, int *new_numberOfKeys)
 			output_ikey++;		/* keep this non-array scan key */
 			continue;
 		}
+
+		/* Determine if we need ordering by distance for array elems */
+		cxt.orderByDistance = scan->numberOfOrderBys > 0 &&
+							  scan->orderByData[0].sk_attno == cur->sk_attno;
 
 		/*
 		 * Deconstruct the array into elements
@@ -450,19 +478,163 @@ _bt_preprocess_array_keys(IndexScanDesc scan, int *new_numberOfKeys)
 		 * Array scan keys with cross-type equality operators will require a
 		 * separate same-type ORDER proc for sorting their array.  Otherwise,
 		 * sortproc just points to the same proc used during binary searches.
+		 *
+		 * In case of distance ordering determine what case are we dealing with
+		 * and setup the scan direction and the array sort order accordingly.
 		 */
-		_bt_setup_array_cmp(scan, cur, elemtype,
-							&so->orderProcs[output_ikey], &sortprocp);
 
-		/*
-		 * Sort the non-null elements and eliminate any duplicates.  We must
-		 * sort in the same ordering used by the index column, so that the
-		 * arrays can be advanced in lockstep with the scan's progress through
-		 * the index's key space.
-		 */
-		reverse = (indoption[cur->sk_attno - 1] & INDOPTION_DESC) != 0;
-		num_elems = _bt_sort_array_elements(scan, cur, sortprocp, reverse,
-											elem_values, num_nonnulls);
+		cxt.sortproc = &sortproc;
+		cxt.distproc = &distproc;
+		cxt.cmpproc = &cmpproc;
+		cxt.cmpdistargproc = &cmpdistargproc;
+
+		sort_array_cmp = _bt_setup_array_cmp(scan, cur, elemtype,
+											 &so->orderProcs[output_ikey], &cxt);
+
+		if (num_nonnulls <= 1)
+			num_elems = num_nonnulls; 	/* no work to do */
+		else
+		{
+			cxt.reverse = false;
+
+			if (!cxt.orderByDistance)
+			{
+				cxt.reverse = (indoption[cur->sk_attno - 1] & INDOPTION_DESC) != 0;
+			}
+			else
+			{
+				/*
+				 * There are three different possible dispositions of
+				 * the ordering key argument relative to the array elements.
+				 */
+				Datum 	min_elem = _bt_find_extreme_element(scan, cur, elemtype,
+															BTLessStrategyNumber,
+															elem_values,
+															num_nonnulls);
+
+				if (-1 !=_bt_compare_array_element_with_dist_arg(&min_elem,
+																&cxt))
+					{
+					/* case A: Ordering key argument is less than all values in array */
+					order_arg_location = LEFT_ORDER_ARG_LOCATION;
+					so->scanDirection = ForwardScanDirection;
+					}
+				else
+				{
+					Datum 	max_elem = _bt_find_extreme_element(scan, cur, elemtype,
+																BTGreaterStrategyNumber,
+																elem_values,
+																num_nonnulls);
+
+					if (1 != _bt_compare_array_element_with_dist_arg(&max_elem,
+																	  &cxt))
+						{
+							/*  case B: Ordering key argument is greater than all values in array */
+							order_arg_location = RIGHT_ORDER_ARG_LOCATION;
+							so->scanDirection = BackwardScanDirection;
+							cxt.reverse = true;
+						}
+						else
+						{
+							/*  case C: Ordering key argument is within the array bounds */
+							order_arg_location = WITHIN_ORDER_ARG_LOCATION;
+							so->scanDirection = ForwardScanDirection;
+						}
+				}
+			}
+
+			if (cxt.orderByDistance && origarrayatt == cur->sk_attno && origreverse != cxt.reverse)
+			{
+				/*
+				 * This array may be merged with the previous. Temporary
+				 * override sort direction so that it is the same as the
+				 * previous one. Restore this later if the merge fails.
+				 */
+				need_reverse = true;
+				cxt.reverse = origreverse;
+			}
+
+			/*
+			 * Sort the non-null array elements and eliminate any duplicates.
+			 * Unless it's case C of distance ordering we must sort in the same
+			 * ordering used by the index column, so that the arrays can be
+			 * advanced in lockstep with the scan's progress through the index's
+			 * key space. In case C of distance ordering. Elements are sorted
+			 * simply by distance from the order key argument.
+			 *
+			 * The array elements are sorted and deduplicated in-place.
+			 * If reverse is true, we sort in descending order.
+			 */
+
+			qsort_arg(elem_values, num_nonnulls, sizeof(Datum),
+						sort_array_cmp, &cxt);
+
+			/* Now scan the sorted elements and remove duplicates */
+			if (!cxt.orderByDistance)
+			{
+				num_elems = qunique_arg(elem_values, num_nonnulls, sizeof(Datum),
+										_bt_compare_array_elements, &cxt);
+			}
+			else
+			{
+				size_t		i,
+							j,
+							eqdind, /* first index of the equidistant subsequence */
+							eqdlen;	/* length of the equidistant subsequence */
+				bool		eqdstart = false;
+
+				/*
+				 * At the start of each iteration:
+				 * i - element to be consider;
+				 * j -  last taken element.
+				 */
+
+				 i = 1;
+				 j = 0;
+
+				while (i < num_nonnulls)
+				{
+					if (eqdstart)
+					{
+						++i;
+						if (i == num_nonnulls ||
+							_bt_compare_array_elements_by_distance(elem_values + i, elem_values + j, &cxt) != 0)
+						{
+							eqdstart = false;
+							/*
+							 * In a equidistance subsequence of length 2 either only the first elem is needed or both.
+							 * No sence to sort it.
+							 */
+							if (i - eqdind > 2)
+								qsort_arg(elem_values + eqdind, i - eqdind, sizeof(Datum),
+										  _bt_compare_array_elements, &cxt);
+							eqdlen = qunique_arg(elem_values + eqdind, i - eqdind, sizeof(Datum),
+												 _bt_compare_array_elements, &cxt);
+							if (j != eqdind)
+								memmove(elem_values + j, elem_values + eqdind, eqdlen * sizeof(Datum));
+
+							j += eqdlen - 1;
+						}
+					}
+					else
+					{
+						if (_bt_compare_array_elements_by_distance(elem_values + i, elem_values + j, &cxt) == 0)
+						{
+							eqdstart = true;
+							eqdind = i - 1;
+						}
+						else
+						{
+							if (++j != i)
+								memcpy(elem_values + j, elem_values + i, sizeof(Datum));
+							++i;
+						}
+					}
+				}
+
+				num_elems = j + 1;
+			}
+		}
 
 		if (origarrayatt == cur->sk_attno)
 		{
@@ -478,9 +650,9 @@ _bt_preprocess_array_keys(IndexScanDesc scan, int *new_numberOfKeys)
 			Assert(arrayKeyData[orig->scan_key].sk_attno == cur->sk_attno);
 			Assert(arrayKeyData[orig->scan_key].sk_collation ==
 				   cur->sk_collation);
-			if (_bt_merge_arrays(scan, cur, sortprocp, reverse,
-								 origelemtype, elemtype,
-								 orig->elem_values, &orig->num_elems,
+			if (_bt_merge_arrays(scan, cur, &cxt,
+								 origelemtype, elemtype, origdistproc,
+								 &orig->elem_values, &orig->num_elems,
 								 elem_values, num_elems))
 			{
 				/* Successfully eliminated this array */
@@ -496,6 +668,48 @@ _bt_preprocess_array_keys(IndexScanDesc scan, int *new_numberOfKeys)
 					break;
 				}
 
+				if (cxt.orderByDistance &&
+					(orig->ord_arg_loc == WITHIN_ORDER_ARG_LOCATION ||
+					 order_arg_location ==  WITHIN_ORDER_ARG_LOCATION))
+				/*
+				 * In case C the just merged array may transforms into A or B.
+				 * Need to recheck that.
+				 */
+
+				{
+					Datum 	min_elem = _bt_find_extreme_element(scan, &arrayKeyData[orig->scan_key], origelemtype,
+															BTLessStrategyNumber,
+															orig->elem_values,
+															orig->num_elems);
+
+					if (-1 !=_bt_compare_array_element_with_dist_arg(&min_elem,
+																	&cxt))
+					{
+						/* case A: Ordering key argument is less than all values in array */
+						orig->ord_arg_loc = LEFT_ORDER_ARG_LOCATION;
+						so->scanDirection = ForwardScanDirection;
+					}
+					else
+					{
+						Datum 	max_elem = _bt_find_extreme_element(scan, &arrayKeyData[orig->scan_key], origelemtype,
+																	BTGreaterStrategyNumber,
+																	orig->elem_values,
+																	orig->num_elems);
+
+						if (1 != _bt_compare_array_element_with_dist_arg(&max_elem,
+																		  &cxt))
+							{
+								/* case B: Ordering key argument is greater than all values in array */
+								orig->ord_arg_loc = RIGHT_ORDER_ARG_LOCATION;
+								so->scanDirection = BackwardScanDirection;
+								cxt.reverse = true;
+								/* Resort change direction of the orig array */
+								qsort_arg(orig->elem_values, orig->num_elems, sizeof(Datum),
+										  _bt_compare_array_elements_by_distance, &cxt);
+							}
+					}
+				}
+
 				/* Throw away this scan key/array */
 				continue;
 			}
@@ -505,6 +719,14 @@ _bt_preprocess_array_keys(IndexScanDesc scan, int *new_numberOfKeys)
 			 * suitable cross-type opfamily support.  Will need to keep both
 			 * scan keys/arrays.
 			 */
+
+			if (cxt.orderByDistance && need_reverse)
+			{
+				need_reverse = false;
+				cxt.reverse = !cxt.reverse;
+				qsort_arg(elem_values, num_nonnulls, sizeof(Datum),
+						  sort_array_cmp, &cxt);
+			}
 		}
 		else
 		{
@@ -519,6 +741,11 @@ _bt_preprocess_array_keys(IndexScanDesc scan, int *new_numberOfKeys)
 			origarrayatt = cur->sk_attno;
 			origarraykey = numArrayKeys;
 			origelemtype = elemtype;
+			if (cxt.orderByDistance)
+			{
+				origdistproc = cxt.distproc->fn_oid;
+				origreverse = cxt.reverse;
+			}
 		}
 
 		/*
@@ -528,6 +755,7 @@ _bt_preprocess_array_keys(IndexScanDesc scan, int *new_numberOfKeys)
 		 * scan_key field later on, after so->keyData[] has been finalized.
 		 */
 		so->arrayKeys[numArrayKeys].scan_key = output_ikey;
+		so->arrayKeys[numArrayKeys].ord_arg_loc = order_arg_location;
 		so->arrayKeys[numArrayKeys].num_elems = num_elems;
 		so->arrayKeys[numArrayKeys].elem_values = elem_values;
 		numArrayKeys++;
@@ -708,28 +936,33 @@ _bt_preprocess_array_keys_final(IndexScanDesc scan, int *keyDataMap)
  * _bt_setup_array_cmp() -- Set up array comparison functions
  *
  * Sets ORDER proc in caller's orderproc argument, which is used during binary
- * searches of arrays during the index scan.  Also sets a same-type ORDER proc
- * in caller's *sortprocp argument, which is used when sorting the array.
+ * searches of arrays during the index scan.  Also sets other fields in the
+ * BTSortArrayContext context which is used when sorting the array.
  *
  * Preprocessing calls here with all equality strategy scan keys (when scan
  * uses equality array keys), including those not associated with any array.
  * See _bt_advance_array_keys for an explanation of why it'll need to treat
  * simple scalar equality scan keys as degenerate single element arrays.
  *
+ * Skey identifies the index column whose opfamily determines the comparison
+ * semantics, and sortproc is a corresponding ORDER proc.
+ *
  * Caller should pass an orderproc pointing to space that'll store the ORDER
  * proc for the scan, and a *sortprocp pointing to its own separate space.
  * When calling here for a non-array scan key, sortprocp arg should be NULL.
  *
  * In the common case where we don't need to deal with cross-type operators,
- * only one ORDER proc is actually required by caller.  We'll set *sortprocp
+ * only one ORDER proc is actually required by caller.  We'll set cxt->sortprocp
  * to point to the same memory that caller's orderproc continues to point to.
- * Otherwise, *sortprocp will continue to point to caller's own space.  Either
- * way, *sortprocp will point to a same-type ORDER proc (since that's the only
- * safe way to sort/deduplicate the array associated with caller's scan key).
+ * Otherwise, cxt->sortprocp will continue to point to caller's own space.
+ * Either way, sortprocp will point to a same-type ORDER proc (since that's
+ * the only safe way to sort/deduplicate the array associated with caller's
+ * scan key).
  */
-static void
+
+static BTSortArrayComparator
 _bt_setup_array_cmp(IndexScanDesc scan, ScanKey skey, Oid elemtype,
-					FmgrInfo *orderproc, FmgrInfo **sortprocp)
+					FmgrInfo *orderproc, BTSortArrayContext *cxt)
 {
 	BTScanOpaque so = (BTScanOpaque) scan->opaque;
 	Relation	rel = scan->indexRelation;
@@ -739,6 +972,10 @@ _bt_setup_array_cmp(IndexScanDesc scan, ScanKey skey, Oid elemtype,
 	Assert(skey->sk_strategy == BTEqualStrategyNumber);
 	Assert(OidIsValid(elemtype));
 
+	/* 1. Find ORDER proc for compare indexcol values with the array elements
+	 * for binary searches of arrays during the index scan.
+	 */
+
 	/*
 	 * If scankey operator is not a cross-type comparison, we can use the
 	 * cached comparison function; otherwise gotta look it up in the catalogs
@@ -747,54 +984,148 @@ _bt_setup_array_cmp(IndexScanDesc scan, ScanKey skey, Oid elemtype,
 	{
 		/* Set same-type ORDER procs for caller */
 		*orderproc = *index_getprocinfo(rel, skey->sk_attno, BTORDER_PROC);
-		if (sortprocp)
-			*sortprocp = orderproc;
+	}
+	else
+	{
+		/*
+		* Look up the appropriate cross-type comparison function in the opfamily.
+		*
+		* Use the opclass input type as the left hand arg type, and the array
+		* element type as the right hand arg type (since binary searches use an
+		* index tuple's attribute value to search for a matching array element).
+		*
+		* Note: it's possible that this would fail, if the opfamily is
+		* incomplete, but only in cases where it's quite likely that _bt_first
+		* would fail in just the same way (had we not failed before it could).
+		*/
+		cmp_proc = get_opfamily_proc(rel->rd_opfamily[skey->sk_attno - 1],
+									opcintype, elemtype, BTORDER_PROC);
+		if (!RegProcedureIsValid(cmp_proc))
+			elog(ERROR, "missing support function %d(%u,%u) for attribute %d of index \"%s\"",
+				BTORDER_PROC, opcintype, elemtype, skey->sk_attno,
+				RelationGetRelationName(rel));
 
-		return;
+		/* Set cross-type ORDER proc for caller */
+		fmgr_info_cxt(cmp_proc, orderproc, so->arrayContext);
 	}
 
-	/*
-	 * Look up the appropriate cross-type comparison function in the opfamily.
-	 *
-	 * Use the opclass input type as the left hand arg type, and the array
-	 * element type as the right hand arg type (since binary searches use an
-	 * index tuple's attribute value to search for a matching array element).
-	 *
-	 * Note: it's possible that this would fail, if the opfamily is
-	 * incomplete, but only in cases where it's quite likely that _bt_first
-	 * would fail in just the same way (had we not failed before it could).
-	 */
-	cmp_proc = get_opfamily_proc(rel->rd_opfamily[skey->sk_attno - 1],
-								 opcintype, elemtype, BTORDER_PROC);
-	if (!RegProcedureIsValid(cmp_proc))
-		elog(ERROR, "missing support function %d(%u,%u) for attribute %d of index \"%s\"",
-			 BTORDER_PROC, opcintype, elemtype, skey->sk_attno,
-			 RelationGetRelationName(rel));
 
-	/* Set cross-type ORDER proc for caller */
-	fmgr_info_cxt(cmp_proc, orderproc, so->arrayContext);
+	/* 2. Find ORDER proc for sorting the array itself */
 
-	/* Done if caller doesn't actually have an array they'll need to sort */
-	if (!sortprocp)
-		return;
+	if (cxt)
+	{
+		cxt->collation = skey->sk_collation;
 
-	/*
-	 * Look up the appropriate same-type comparison function in the opfamily.
-	 *
-	 * Note: it's possible that this would fail, if the opfamily is
-	 * incomplete, but it seems quite unlikely that an opfamily would omit
-	 * non-cross-type comparison procs for any datatype that it supports at
-	 * all.
-	 */
-	cmp_proc = get_opfamily_proc(rel->rd_opfamily[skey->sk_attno - 1],
-								 elemtype, elemtype, BTORDER_PROC);
-	if (!RegProcedureIsValid(cmp_proc))
-		elog(ERROR, "missing support function %d(%u,%u) for attribute %d of index \"%s\"",
-			 BTORDER_PROC, elemtype, elemtype,
-			 skey->sk_attno, RelationGetRelationName(rel));
+		if (elemtype == opcintype)
+		{
+			/* Set same-type ORDER procs for caller */
+			cxt->sortproc = orderproc;
+		}
+		else
+		{
+			/*
+			 * Look up the appropriate same-type comparison function in the opfamily.
+			 *
+			 * Note: it's possible that this would fail, if the opfamily is
+			 * incomplete, but it seems quite unlikely that an opfamily would omit
+			 * non-cross-type comparison procs for any datatype that it supports at
+			 * all.
+			 */
+			cmp_proc = get_opfamily_proc(rel->rd_opfamily[skey->sk_attno - 1],
+										elemtype, elemtype, BTORDER_PROC);
+			if (!RegProcedureIsValid(cmp_proc))
+				elog(ERROR, "missing support function %d(%u,%u) for attribute %d of index \"%s\"",
+					BTORDER_PROC, elemtype, elemtype,
+					skey->sk_attno, RelationGetRelationName(rel));
 
-	/* Set same-type ORDER proc for caller */
-	fmgr_info_cxt(cmp_proc, *sortprocp, so->arrayContext);
+			/* Set same-type ORDER proc for caller */
+			fmgr_info_cxt(cmp_proc, cxt->sortproc, so->arrayContext);
+		}
+
+	   /*
+		* The current sortproc is for compare the array elems with
+		* each other but now we may compare by the distance to the
+		* ordering key argument.
+		* Before finding the desired by distance sortproc save current
+		* sortproc also as cmpproc.
+		*/
+
+		fmgr_info_cxt(cxt->sortproc->fn_oid, cxt->cmpproc, so->arrayContext);
+
+		if (cxt->orderByDistance)
+		{
+			/*
+			 * Need to sort array by distance to ordering key argument.
+			 * So init procedures for distance calculation and comparison.
+			 */
+			ScanKey		distkey = &scan->orderByData[0];
+			Oid			disttype = distkey->sk_subtype;
+			Oid			distopr;
+			RegProcedure distproc;
+			Oid			opfamily = rel->rd_opfamily[skey->sk_attno - 1];
+
+			if (!OidIsValid(disttype))
+				disttype = rel->rd_opcintype[skey->sk_attno - 1];
+
+			/* Lookup distance operator in index column's operator family. */
+			distopr = get_opfamily_member(opfamily,
+										  elemtype,
+										  disttype,
+										  distkey->sk_strategy);
+
+			if (!OidIsValid(distopr))
+				elog(ERROR, "missing operator (%u,%u) for strategy %d in opfamily %u",
+					elemtype, disttype, BTMaxStrategyNumber, opfamily);
+
+			distproc = get_opcode(distopr);
+
+			if (!RegProcedureIsValid(distproc))
+				elog(ERROR, "missing code for operator %u", distopr);
+
+			fmgr_info(distproc, cxt->distproc);
+
+			cxt->distarg = scan->orderByData[0].sk_argument;
+			cxt->distCollation = distkey->sk_collation;
+
+			if (disttype == elemtype)
+			{
+				/*
+				 * We can use same-type ORDER procs for sort distance results
+				 * and for compare array elems with ordering key argument
+				 */
+				cxt->cmpdistargproc = cxt->cmpproc = cxt->sortproc = orderproc;
+			}
+			else
+			{
+				/*
+				 * Look up the appropriate comparison functions in the opfamily.
+				 */
+				cmp_proc = get_opfamily_proc(rel->rd_opfamily[skey->sk_attno - 1],
+											disttype, disttype, BTORDER_PROC);
+				if (!RegProcedureIsValid(cmp_proc))
+					elog(ERROR, "missing support function %d(%u,%u) for attribute %d of index \"%s\"",
+						BTORDER_PROC, disttype, disttype,
+						skey->sk_attno, RelationGetRelationName(rel));
+
+				/* Set same-type ORDER proc for caller */
+				fmgr_info_cxt(cmp_proc, cxt->sortproc, so->arrayContext);
+
+				cmp_proc = get_opfamily_proc(rel->rd_opfamily[skey->sk_attno - 1],
+											elemtype, disttype, BTORDER_PROC);
+				if (!RegProcedureIsValid(cmp_proc))
+					elog(ERROR, "missing support function %d(%u,%u) for attribute %d of index \"%s\"",
+						BTORDER_PROC, elemtype, disttype,
+						skey->sk_attno, RelationGetRelationName(rel));
+
+				/* Set cross-type ORDER proc for caller */
+				fmgr_info_cxt(cmp_proc, cxt->cmpdistargproc, so->arrayContext);
+			}
+
+			return _bt_compare_array_elements_by_distance;
+		}
+	}
+
+	return _bt_compare_array_elements;
 }
 
 /*
@@ -824,7 +1155,6 @@ _bt_find_extreme_element(IndexScanDesc scan, ScanKey skey, Oid elemtype,
 	 * non-cross-type comparison operators for any datatype that it supports
 	 * at all.
 	 */
-	Assert(skey->sk_strategy != BTEqualStrategyNumber);
 	Assert(OidIsValid(elemtype));
 	cmp_op = get_opfamily_member(rel->rd_opfamily[skey->sk_attno - 1],
 								 elemtype,
@@ -854,95 +1184,6 @@ _bt_find_extreme_element(IndexScanDesc scan, ScanKey skey, Oid elemtype,
 	return result;
 }
 
-/*
- * _bt_sort_array_elements() -- sort and de-dup array elements
- *
- * The array elements are sorted in-place, and the new number of elements
- * after duplicate removal is returned.
- *
- * skey identifies the index column whose opfamily determines the comparison
- * semantics, and sortproc is a corresponding ORDER proc.  If reverse is true,
- * we sort in descending order.
- */
-static int
-_bt_sort_array_elements(IndexScanDesc scan, ScanKey skey, FmgrInfo *sortproc, bool reverse,
-						Datum *elems, int nelems)
-{
-	Relation	rel = scan->indexRelation;
-	Oid			elemtype;
-	Oid			opfamily;
-	BTSortArrayContext cxt;
-
-	if (nelems <= 1)
-		return nelems;			/* no work to do */
-
-	/*
-	 * Determine the nominal datatype of the array elements.  We have to
-	 * support the convention that sk_subtype == InvalidOid means the opclass
-	 * input type; this is a hack to simplify life for ScanKeyInit().
-	 */
-	elemtype = skey->sk_subtype;
-	if (elemtype == InvalidOid)
-		elemtype = rel->rd_opcintype[skey->sk_attno - 1];
-
-	opfamily = rel->rd_opfamily[skey->sk_attno - 1];
-
-	if (scan->numberOfOrderBys <= 0 ||
-		scan->orderByData[0].sk_attno != skey->sk_attno)
-	{
-		cxt.distkey = NULL;
-		cxt.reverse = reverse;
-	}
-	else
-	{
-		/* Init procedures for distance calculation and comparison. */
-		ScanKey		distkey = &scan->orderByData[0];
-		ScanKeyData distkey2;
-		Oid			disttype = distkey->sk_subtype;
-		Oid			distopr;
-		RegProcedure distproc;
-
-		if (!OidIsValid(disttype))
-			disttype = rel->rd_opcintype[skey->sk_attno - 1];
-
-		/* Lookup distance operator in index column's operator family. */
-		distopr = get_opfamily_member(opfamily,
-									  elemtype,
-									  disttype,
-									  distkey->sk_strategy);
-
-		if (!OidIsValid(distopr))
-			elog(ERROR, "missing operator (%u,%u) for strategy %d in opfamily %u",
-				 elemtype, disttype, BTMaxStrategyNumber, opfamily);
-
-		distproc = get_opcode(distopr);
-
-		if (!RegProcedureIsValid(distproc))
-			elog(ERROR, "missing code for operator %u", distopr);
-
-		fmgr_info(distproc, &cxt.distflinfo);
-
-		distkey2 = *distkey;
-		fmgr_info_copy(&distkey2.sk_func, &cxt.distflinfo, CurrentMemoryContext);
-		distkey2.sk_subtype = disttype;
-
-		_bt_get_distance_cmp_proc(&distkey2, opfamily, elemtype,
-								  &cxt.distcmpflinfo, NULL, NULL);
-
-		cxt.distkey = distkey;
-		cxt.reverse = false;	/* supported only ascending ordering */
-	}
-
-	/* Sort the array elements */
-	cxt.sortproc = sortproc;
-	cxt.collation = skey->sk_collation;
-	qsort_arg(elems, nelems, sizeof(Datum),
-			  _bt_compare_array_elements, &cxt);
-
-	/* Now scan the sorted elements and remove duplicates */
-	return qunique_arg(elems, nelems, sizeof(Datum),
-					   _bt_compare_array_elements, &cxt);
-}
 
 /*
  * _bt_merge_arrays() -- merge next array's elements into an original array
@@ -954,10 +1195,10 @@ _bt_sort_array_elements(IndexScanDesc scan, ScanKey skey, FmgrInfo *sortproc, bo
  * elements together like this would be wrong, since they don't necessarily
  * use the same underlying element type, despite all the other similarities.)
  *
- * Both arrays must have already been sorted and deduplicated by calling
- * _bt_sort_array_elements.  sortproc is the same-type ORDER proc that was
- * just used to sort and deduplicate caller's "next" array.  We'll usually be
- * able to reuse that order PROC to merge the arrays together now.  If not,
+ * Both arrays must have already been sorted and deduplicated. The next_cxt is
+ * the same context containing set of ORDER functions that was just used to
+ * sort and deduplicate caller's "next" array.  We'll usually be able to
+ * reuse next_cxt.sortproc to merge the arrays together now.  If not,
  * then we'll perform a separate ORDER proc lookup.
  *
  * If the opfamily doesn't supply a complete set of cross-type ORDER procs we
@@ -968,18 +1209,19 @@ _bt_sort_array_elements(IndexScanDesc scan, ScanKey skey, FmgrInfo *sortproc, bo
  * keep both arrays when this happens).
  */
 static bool
-_bt_merge_arrays(IndexScanDesc scan, ScanKey skey, FmgrInfo *sortproc,
-				 bool reverse, Oid origelemtype, Oid nextelemtype,
-				 Datum *elems_orig, int *nelems_orig,
+_bt_merge_arrays(IndexScanDesc scan, ScanKey skey, BTSortArrayContext *next_cxt,
+				 Oid origelemtype, Oid nextelemtype, Oid origdistproc,
+				 Datum **elems_orig, int *nelems_orig,
 				 Datum *elems_next, int nelems_next)
 {
 	Relation	rel = scan->indexRelation;
 	BTScanOpaque so = (BTScanOpaque) scan->opaque;
-	BTSortArrayContext cxt;
+	BTSortArrayContext ncxt;
 	int			nelems_orig_start = *nelems_orig,
 				nelems_orig_merged = 0;
-	FmgrInfo   *mergeproc = sortproc;
+	FmgrInfo   *mergeproc = next_cxt->sortproc;
 	FmgrInfo	crosstypeproc;
+	Datum 		*sort_result;
 
 	Assert(skey->sk_strategy == BTEqualStrategyNumber);
 	Assert(OidIsValid(origelemtype) && OidIsValid(nextelemtype));
@@ -1005,27 +1247,100 @@ _bt_merge_arrays(IndexScanDesc scan, ScanKey skey, FmgrInfo *sortproc,
 		fmgr_info_cxt(cmp_proc, mergeproc, so->arrayContext);
 	}
 
-	cxt.sortproc = mergeproc;
-	cxt.collation = skey->sk_collation;
-	cxt.reverse = reverse;
-	cxt.distkey = NULL;
+	ncxt.cmpproc = ncxt.sortproc = mergeproc;
+	ncxt.collation = skey->sk_collation;
+	ncxt.reverse = next_cxt->reverse;
 
-	for (int i = 0, j = 0; i < nelems_orig_start && j < nelems_next;)
+	if (next_cxt->orderByDistance)
 	{
-		Datum	   *oelem = elems_orig + i,
-				   *nelem = elems_next + j;
-		int			res = _bt_compare_array_elements(oelem, nelem, &cxt);
+		BTSortArrayContext orig_cxt;
+		BTSortArrayContext *ocxt = NULL;
+		ncxt.distproc = next_cxt->distproc;
+		ncxt.distCollation = next_cxt->distCollation;
+		ncxt.distarg = next_cxt->distarg;
 
-		if (res == 0)
+		if (origelemtype != nextelemtype)
 		{
-			elems_orig[nelems_orig_merged++] = *oelem;
-			i++;
-			j++;
+			/*
+			 * If the elements of the arrays to be merged are of different types
+			 * we need two different functions for distance calculations.
+			 */
+			ocxt = &orig_cxt;
+			memcpy(ocxt, &ncxt, sizeof(BTSortArrayContext));
+			fmgr_info_cxt(origdistproc, orig_cxt.distproc, so->arrayContext);
 		}
-		else if (res < 0)
-			i++;
-		else					/* res > 0 */
-			j++;
+
+		/* Extent original (previous) array to the worst case before qunique */
+		sort_result = (Datum *) palloc((*nelems_orig + nelems_next) * sizeof(Datum));
+
+		for (int i = 0, j = 0; i < nelems_orig_start && j < nelems_next;)
+		{
+			Datum	   *oelem = *elems_orig + i,
+					   *nelem = elems_next + j;
+			int			res = _bt_cross_compare_array_elements_by_distance(oelem, nelem, &ncxt, ocxt);
+
+			if (res == 0)
+			{
+				Datum	   *base_elem = oelem;
+				int			eqdiststart, eqdistend;
+
+				eqdiststart = i; /* start index of a subsequence of elements with the same distance */
+				oelem = ++i + *elems_orig;
+
+				while (i < nelems_orig_start && ! _bt_cross_compare_array_elements_by_distance(oelem, base_elem, &ncxt, ocxt))
+				{
+					oelem = ++i + *elems_orig;
+				}
+
+				eqdistend = i; /* the final one. See above. */
+
+				while (j < nelems_next && ! _bt_cross_compare_array_elements_by_distance(nelem, base_elem, &ncxt, ocxt))
+				{
+					bool res = false; /* don't take it by default */
+					for (int k = eqdiststart; k < eqdistend; ++k)
+						if (!_bt_compare_array_elements(nelem, *elems_orig + k, &ncxt))
+						{
+							res = true; /* At least one match. Take it. */
+							break;
+						}
+
+					if (res)
+						sort_result[nelems_orig_merged++] = *nelem;
+
+					nelem = ++j + elems_next;
+				}
+			}
+			else if (res < 0)
+			{
+				i++;
+			}
+			else	/* res > 0 */
+			{
+				j++;
+			}
+		}
+
+		*elems_orig = sort_result;
+	}
+	else
+	{
+		for (int i = 0, j = 0; i < nelems_orig_start && j < nelems_next;)
+		{
+			Datum	   *oelem = *elems_orig + i,
+					   *nelem = elems_next + j;
+			int			res = _bt_compare_array_elements(oelem, nelem, &ncxt);
+
+			if (res == 0)
+			{
+				*elems_orig[nelems_orig_merged++] = *oelem;
+				i++;
+				j++;
+			}
+			else if (res < 0)
+				i++;
+			else					/* res > 0 */
+				j++;
+		}
 	}
 
 	*nelems_orig = nelems_orig_merged;
@@ -1060,7 +1375,7 @@ _bt_compare_array_scankey_args(IndexScanDesc scan, ScanKey arraysk, ScanKey skey
 	Oid			opcintype = rel->rd_opcintype[arraysk->sk_attno - 1];
 	int			cmpresult = 0,
 				cmpexact = 0,
-				matchelem,
+				matchelem = 0,
 				new_nelems = 0;
 	FmgrInfo	crosstypeproc;
 	FmgrInfo   *orderprocp = orderproc;
@@ -1116,10 +1431,17 @@ _bt_compare_array_scankey_args(IndexScanDesc scan, ScanKey arraysk, ScanKey skey
 		fmgr_info(cmp_proc, orderprocp);
 	}
 
-	matchelem = _bt_binsrch_array_skey(orderprocp, false,
-									   NoMovementScanDirection,
-									   skey->sk_argument, false, array,
-									   arraysk, &cmpresult);
+	/*
+	 * If ordering argument is within the array bounds the arrays is ordered
+	 * nor ascending nor descending. So use in-place removing of the non-matching
+	 * elements instead of binsearch.
+	 */
+
+	if (!(array->ord_arg_loc == WITHIN_ORDER_ARG_LOCATION))
+		matchelem = _bt_binsrch_array_skey(orderprocp, false,
+										   NoMovementScanDirection,
+										   skey->sk_argument, false, array,
+										   arraysk, &cmpresult);
 
 	switch (skey->sk_strategy)
 	{
@@ -1127,10 +1449,28 @@ _bt_compare_array_scankey_args(IndexScanDesc scan, ScanKey arraysk, ScanKey skey
 			cmpexact = 1;		/* exclude exact match, if any */
 			/* FALL THRU */
 		case BTLessEqualStrategyNumber:
-			if (cmpresult >= cmpexact)
-				matchelem++;
-			/* Resize, keeping elements from the start of the array */
-			new_nelems = matchelem;
+			if (array->ord_arg_loc == WITHIN_ORDER_ARG_LOCATION)
+			{
+				int 	cur_elem,
+						result;
+
+				new_nelems = 0;
+
+				for(cur_elem = 0; cur_elem < array->num_elems; ++cur_elem)
+				{
+					result = _bt_compare_array_skey(orderproc, array->elem_values[cur_elem], false,
+													skey->sk_argument, arraysk);
+					if (result < cmpexact)
+						array->elem_values[new_nelems++] = array->elem_values[cur_elem];
+				}
+			}
+			else
+			{
+				if (cmpresult >= cmpexact)
+					matchelem++;
+				/* Resize, keeping elements from the start of the array */
+				new_nelems = matchelem;
+			}
 			break;
 		case BTEqualStrategyNumber:
 			if (cmpresult != 0)
@@ -1149,12 +1489,30 @@ _bt_compare_array_scankey_args(IndexScanDesc scan, ScanKey arraysk, ScanKey skey
 			cmpexact = 1;		/* include exact match, if any */
 			/* FALL THRU */
 		case BTGreaterStrategyNumber:
-			if (cmpresult >= cmpexact)
-				matchelem++;
-			/* Shift matching elements to the start of the array, resize */
-			new_nelems = array->num_elems - matchelem;
-			memmove(array->elem_values, array->elem_values + matchelem,
-					sizeof(Datum) * new_nelems);
+			if (array->ord_arg_loc == WITHIN_ORDER_ARG_LOCATION)
+			{
+				int 	cur_elem,
+						result;
+
+				new_nelems = 0;
+
+				for(cur_elem = 0; cur_elem < array->num_elems; ++cur_elem)
+				{
+					result = _bt_compare_array_skey(orderproc, skey->sk_argument, false,
+													array->elem_values[cur_elem], arraysk);
+					if (result < cmpexact)
+						array->elem_values[new_nelems++] = array->elem_values[cur_elem];
+				}
+			}
+			else
+			{
+				if (cmpresult >= cmpexact)
+					matchelem++;
+				/* Shift matching elements to the start of the array, resize */
+				new_nelems = array->num_elems - matchelem;
+				memmove(array->elem_values, array->elem_values + matchelem,
+						sizeof(Datum) * new_nelems);
+			}
 			break;
 		default:
 			elog(ERROR, "unrecognized StrategyNumber: %d",
@@ -1182,29 +1540,98 @@ _bt_compare_array_elements(const void *a, const void *b, void *arg)
 	BTSortArrayContext *cxt = (BTSortArrayContext *) arg;
 	int32		compare;
 
-	if (cxt->distkey)
-	{
-		Datum		dista = FunctionCall2Coll(&cxt->distflinfo,
-											  cxt->collation,
-											  da,
-											  cxt->distkey->sk_argument);
-		Datum		distb = FunctionCall2Coll(&cxt->distflinfo,
-											  cxt->collation,
-											  db,
-											  cxt->distkey->sk_argument);
-		bool		cmp = DatumGetBool(FunctionCall2Coll(&cxt->distcmpflinfo,
-														 cxt->collation,
-														 dista,
-														 distb));
-
-		return cmp ? -1 : 1;
-	}
-
-	compare = DatumGetInt32(FunctionCall2Coll(cxt->sortproc,
+	compare = DatumGetInt32(FunctionCall2Coll(cxt->cmpproc,
 											  cxt->collation,
 											  da, db));
 	if (cxt->reverse)
 		INVERT_COMPARE_RESULT(compare);
+	return compare;
+}
+
+static int
+_bt_compare_array_element_with_dist_arg(const void *n, void *arg)
+{
+	BTSortArrayContext *cxt = (BTSortArrayContext *) arg;
+	Datum		distarg = *((const Datum *) &cxt->distarg);
+	Datum		dn = *((const Datum *) n);
+	int32		compare;
+
+	compare = DatumGetInt32(FunctionCall2Coll(cxt->cmpdistargproc,
+											  cxt->distCollation,
+											  dn, distarg));
+	return compare;
+}
+
+static int
+_bt_compare_array_elements_by_distance(const void *a, const void *b, void *arg)
+{
+	Datum		da = *((const Datum *) a);
+	Datum		db = *((const Datum *) b);
+	Datum		dista, distb;
+	BTSortArrayContext *cxt = (BTSortArrayContext *) arg;
+	int32 compare;
+
+	dista = FunctionCall2Coll(cxt->distproc,
+							  cxt->distCollation,
+							  da,
+							  cxt->distarg);
+
+	distb = FunctionCall2Coll(cxt->distproc,
+							  cxt->distCollation,
+							  db,
+							  cxt->distarg);
+
+	compare = DatumGetInt32(FunctionCall2Coll(cxt->sortproc,
+											  cxt->collation,
+											  dista,
+											  distb));
+
+	if (cxt->reverse)
+		INVERT_COMPARE_RESULT(compare);
+
+	return compare;
+}
+
+static int
+_bt_cross_compare_array_elements_by_distance(const void *a, const void *b,
+											 void *arga, void *argb)
+{
+	Datum		da = *((const Datum *) a);
+	Datum		db = *((const Datum *) b);
+	Datum		dista, distb;
+	int32 compare;
+
+	if (argb == NULL)
+	{
+		compare = _bt_compare_array_elements_by_distance(a, b, arga);
+	}
+	else
+	{
+		BTSortArrayContext *cxta = (BTSortArrayContext *) arga;
+		BTSortArrayContext *cxtb = (BTSortArrayContext *) argb;
+
+		Assert(cxta->sortproc->fn_oid == cxtb->sortproc->fn_oid);
+		Assert(cxta->collation == cxtb->collation);
+		Assert(cxta->reverse == cxtb->reverse);
+
+		dista = FunctionCall2Coll(cxta->distproc,
+								cxta->distCollation,
+								da,
+								cxta->distarg);
+
+		distb = FunctionCall2Coll(cxtb->distproc,
+								cxtb->distCollation,
+								db,
+								cxtb->distarg);
+
+		compare = DatumGetInt32(FunctionCall2Coll(cxta->sortproc,
+												  cxta->collation,
+												  dista,
+												  distb));
+		if (cxta->reverse)
+			INVERT_COMPARE_RESULT(compare);
+	}
+
 	return compare;
 }
 
@@ -1351,6 +1778,14 @@ _bt_binsrch_array_skey(FmgrInfo *orderproc,
 					*set_elem_result = result;
 					return low_elem;
 				}
+
+				if (array->ord_arg_loc == WITHIN_ORDER_ARG_LOCATION)
+				{
+					/* Caller needs to perform "beyond end" array advancement */
+					*set_elem_result = 1;
+					return array->cur_elem;
+				}
+
 				mid_elem = low_elem;
 				low_elem++;		/* this cur_elem exhausted, too */
 			}
@@ -1379,6 +1814,14 @@ _bt_binsrch_array_skey(FmgrInfo *orderproc,
 					*set_elem_result = result;
 					return high_elem;
 				}
+
+				if (array->ord_arg_loc == WITHIN_ORDER_ARG_LOCATION)
+				{
+					/* Caller needs to perform "beyond end" array advancement */
+					*set_elem_result = -1;
+					return array->cur_elem;
+				}
+
 				mid_elem = high_elem;
 				high_elem--;	/* this cur_elem exhausted, too */
 			}
@@ -1453,7 +1896,8 @@ _bt_start_array_keys(IndexScanDesc scan, ScanDirection dir)
 		Assert(curArrayKey->num_elems > 0);
 		Assert(skey->sk_flags & SK_SEARCHARRAY);
 
-		if (ScanDirectionIsBackward(dir))
+		if (ScanDirectionIsBackward(dir) &&
+			curArrayKey->ord_arg_loc != WITHIN_ORDER_ARG_LOCATION)
 			curArrayKey->cur_elem = curArrayKey->num_elems - 1;
 		else
 			curArrayKey->cur_elem = 0;
@@ -1497,10 +1941,13 @@ _bt_advance_array_keys_increment(IndexScanDesc scan, ScanDirection dir)
 			cur_elem = 0;
 			rolled = true;
 		}
-		else if (ScanDirectionIsBackward(dir) && --cur_elem < 0)
+		else if (ScanDirectionIsBackward(dir))
 		{
-			cur_elem = num_elems - 1;
-			rolled = true;
+			if (--cur_elem < 0)
+			{
+				cur_elem = num_elems - 1;
+				rolled = true;
+			}
 		}
 
 		curArrayKey->cur_elem = cur_elem;
@@ -1529,6 +1976,33 @@ _bt_advance_array_keys_increment(IndexScanDesc scan, ScanDirection dir)
 	_bt_start_array_keys(scan, -dir);
 
 	return false;
+}
+
+void
+_bt_force_advance_array_keys(IndexScanDesc scan, BTReadPageState *pstate)
+{
+
+	BTScanOpaque so = (BTScanOpaque) scan->opaque;
+	BTScanPos currPos = &so->state.currPos;
+
+	if (so->needPrimScan)
+		return;
+
+	pstate->continuescan = false;
+	so->needPrimScan = _bt_advance_array_keys_increment(scan, currPos->dir);
+
+	if (scan->parallel_scan)
+	{
+		if (so->needPrimScan)
+			_bt_parallel_primscan_schedule(scan, currPos->currPage);
+		else
+		{
+			if (!BufferIsValid(currPos->buf))
+				_bt_parallel_done(scan, &so->state);
+		}
+	}
+
+	return;
 }
 
 /*
@@ -2320,6 +2794,14 @@ _bt_advance_array_keys(IndexScanDesc scan, BTReadPageState *pstate,
 		/* Caller's tuple doesn't match any qual */
 		return false;
 	}
+
+	/*
+	 * For case C of distance ordering we use old behaviour:
+	 * a separate primscan for every SAOP element.
+	 * Future optimization is possible here although.
+	 */
+	if (pstate->ordArgInsideArray)
+		goto new_prim_scan;
 
 	/*
 	 * Postcondition array state assertion (for still-unsatisfied tuples).
