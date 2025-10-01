@@ -289,6 +289,67 @@ DROP TABLE btree_part;
 
 SET enable_bitmapscan = OFF;
 
+SET enable_seqscan = OFF;
+
+-- Simple knn tests within one index page.
+-- there are three possible cases:
+-- case A: ordering argument is less or equal to the minarray element;
+-- case B: ordering argument is greater or equal to the max element;
+-- case C: ordering argument is within the array bounds.
+
+CREATE TABLE simple_knn_test (a int4);
+INSERT INTO simple_knn_test VALUES (1), (2), (3), (4), (5);
+CREATE INDEX simple_knn_test_idx ON simple_knn_test USING btree(a);
+
+-- case A
+EXPLAIN (COSTS OFF)
+SELECT * FROM simple_knn_test WHERE a IN (4, 2, 3) ORDER BY a <-> 1;
+
+SELECT * FROM simple_knn_test WHERE a IN (4, 2, 3) ORDER BY a <-> 1;
+
+-- case B
+EXPLAIN (COSTS OFF)
+SELECT * FROM simple_knn_test WHERE a IN (4, 2, 3) ORDER BY a <-> 5;
+
+SELECT * FROM simple_knn_test WHERE a IN (4, 2, 3) ORDER BY a <-> 5;
+
+-- case C
+EXPLAIN (COSTS OFF)
+SELECT * FROM simple_knn_test WHERE a IN (4, 2, 3) ORDER BY a <-> 3;
+
+SELECT * FROM simple_knn_test WHERE a IN (4, 2, 3) ORDER BY a <-> 3;
+
+-- test merge of arrays
+-- if the first or second array belonged to case C, then the result array after
+-- merging may falls into A or B.
+--
+-- must be empty result array
+SELECT * FROM simple_knn_test WHERE a IN (1, 2) AND a IN (4, 5) ORDER BY a <-> 3;
+SELECT * FROM simple_knn_test WHERE a IN (5, 4) AND a IN (2, 1) ORDER BY a <-> 3;
+
+-- saving the same case
+SELECT * FROM simple_knn_test WHERE a IN (3, 1, 2) AND a IN (3, 2, 4) ORDER BY a <-> 1;
+SELECT * FROM simple_knn_test WHERE a IN (3, 1, 2) AND a IN (3, 2, 4) ORDER BY a <-> 4;
+
+-- C + A -> A,  A + C -> A
+SELECT * FROM simple_knn_test WHERE a IN (3, 4, 2) AND a IN (5, 3, 4) ORDER BY a <-> 3;
+SELECT * FROM simple_knn_test WHERE a IN (5, 3, 4) AND a IN (3, 4, 2) ORDER BY a <-> 3;
+
+-- C + B -> B,  B + C -> B
+SELECT * FROM simple_knn_test WHERE a IN (3, 4, 2) AND a IN (2, 3, 1) ORDER BY a <-> 3;
+SELECT * FROM simple_knn_test WHERE a IN (2, 3, 1) AND a IN (3, 4, 2) ORDER BY a <-> 3;
+
+-- C + C -> A,  C + C -> B
+SELECT * FROM simple_knn_test WHERE a IN (3, 4, 2) AND a IN (4, 1, 3) ORDER BY a <-> 3;
+SELECT * FROM simple_knn_test WHERE a IN (3, 4, 2) AND a IN (5, 2, 3) ORDER BY a <-> 3;
+
+-- mixed the same order distance
+SELECT * FROM simple_knn_test WHERE a IN (2, 4, 1, 5) AND a IN (4, 2, 5, 1) ORDER BY a <-> 3;
+SELECT * FROM simple_knn_test WHERE a IN (4, 2, 5, 1) AND a IN (2, 4, 1, 5) ORDER BY a <-> 3;
+
+DROP TABLE simple_knn_test CASCADE;
+RESET enable_seqscan;
+
 -- temporarily disable bt_i4_index index on bt_i4_heap(seqno)
 UPDATE pg_index SET indisvalid = false WHERE indexrelid = 'bt_i4_index'::regclass;
 

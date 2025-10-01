@@ -1911,6 +1911,18 @@ _bt_readpage(IndexScanDesc scan, BTScanState state, ScanDirection dir, OffsetNum
 	pstate.firstmatch = false;
 	pstate.rechecks = 0;
 	pstate.targetdistance = 0;
+	pstate.ordArgInsideArray = false;
+
+	/* Check if it is a type C scan. See comment to the enum OrderArgLocation */
+	for (int i = 0; i < so->numArrayKeys; i++)
+	{
+		BTArrayKeyInfo *array = &so->arrayKeys[i];
+		if (array->ord_arg_loc == WITHIN_ORDER_ARG_LOCATION)
+		{
+			pstate.ordArgInsideArray = true;
+			break;
+		}
+	}
 
 	/*
 	 * We note the buffer's block number so that we can release the pin later.
@@ -2109,6 +2121,9 @@ _bt_readpage(IndexScanDesc scan, BTScanState state, ScanDirection dir, OffsetNum
 			_bt_checkkeys(scan, &pstate, arrayKeys, itup, truncatt);
 		}
 
+		if (pstate.ordArgInsideArray && pstate.continuescan && P_RIGHTMOST(opaque))
+			_bt_force_advance_array_keys(scan, &pstate);
+
 		if (!pstate.continuescan)
 			pos->moreRight = false;
 
@@ -2223,6 +2238,10 @@ _bt_readpage(IndexScanDesc scan, BTScanState state, ScanDirection dir, OffsetNum
 					}
 				}
 			}
+
+			if (pstate.ordArgInsideArray && pstate.continuescan && P_LEFTMOST(opaque))
+				_bt_force_advance_array_keys(scan, &pstate);
+
 			if (!pstate.continuescan)
 			{
 				/* there can't be any more matches, so stop */

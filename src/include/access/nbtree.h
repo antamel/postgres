@@ -1029,13 +1029,30 @@ typedef BTScanPosData *BTScanPos;
 		(scanpos).nextTupleOffset = 0; \
 	} while (0)
 
+/*
+ * When ordering by distance, there are three possible cases:
+ * case A: ordering argument is less or equal to the minarray element;
+ * case B: ordering argument is greater or equal to the max element;
+ * case C: ordering argument is within the array bounds.
+ * This enum defines these three cases.
+ */
+
+ typedef enum OrderArgLocation
+{
+	UNKNOWN_ORDER_ARG_LOCATION = 0,
+	LEFT_ORDER_ARG_LOCATION,	/* go forward */
+	WITHIN_ORDER_ARG_LOCATION,  /* iterate by elements */
+	RIGHT_ORDER_ARG_LOCATION,   /* go backward */
+} OrderArgLocation;
+
 /* We need one of these for each equality-type SK_SEARCHARRAY scan key */
 typedef struct BTArrayKeyInfo
 {
-	int			scan_key;		/* index of associated key in keyData */
-	int			cur_elem;		/* index of current element in elem_values */
-	int			num_elems;		/* number of elems in current array value */
-	Datum	   *elem_values;	/* array of num_elems Datums */
+	int					scan_key;		/* index of associated key in keyData */
+	OrderArgLocation  	ord_arg_loc; 	/* location of the ordering argument */
+	int					cur_elem;		/* index of current element in elem_values */
+	int					num_elems;		/* number of elems in current array value */
+	Datum	   			*elem_values;	/* array of num_elems Datums */
 } BTArrayKeyInfo;
 
 typedef struct BTScanStateData
@@ -1119,6 +1136,7 @@ typedef struct BTReadPageState
 	IndexTuple	finaltup;		/* Needed by scans with array keys */
 	BlockNumber prev_scan_page; /* previous _bt_parallel_release block */
 	Page		page;			/* Page being read */
+	bool		ordArgInsideArray;
 
 	/* Per-tuple input parameters, set by _bt_readpage for _bt_checkkeys */
 	OffsetNumber offnum;		/* current tuple's page offset number */
@@ -1319,6 +1337,7 @@ extern void _bt_start_array_keys(IndexScanDesc scan, ScanDirection dir);
 extern void _bt_preprocess_keys(IndexScanDesc scan);
 extern bool _bt_checkkeys(IndexScanDesc scan, BTReadPageState *pstate, bool arrayKeys,
 						  IndexTuple tuple, int tupnatts);
+extern void _bt_force_advance_array_keys(IndexScanDesc scan, BTReadPageState *pstate);
 extern void _bt_killitems(BTScanState state, Relation indexRelation);
 extern BTCycleId _bt_vacuum_cycleid(Relation rel);
 extern BTCycleId _bt_start_vacuum(Relation rel);
