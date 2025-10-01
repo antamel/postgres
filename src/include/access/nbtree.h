@@ -1032,6 +1032,22 @@ typedef BTScanPosData *BTScanPos;
 		(scanpos).currPage = InvalidBlockNumber; \
 	} while (0)
 
+/*
+ * When ordering by distance, there are three possible cases:
+ * case A: ordering argument is less or equal to the minarray element;
+ * case B: ordering argument is greater or equal to the max element;
+ * case C: ordering argument is within the array bounds.
+ * This enum defines these three cases.
+ */
+
+typedef enum BTOrderArgLocation
+{
+	UNKNOWN_ORDER_ARG_LOCATION = 0,
+	LEFT_ORDER_ARG_LOCATION,	/* go forward */
+	WITHIN_ORDER_ARG_LOCATION,	/* iterate by elements */
+	RIGHT_ORDER_ARG_LOCATION,	/* go backward */
+}			BTOrderArgLocation;
+
 /* We need one of these for each equality-type SK_SEARCHARRAY scan key */
 typedef struct BTArrayKeyInfo
 {
@@ -1042,6 +1058,7 @@ typedef struct BTArrayKeyInfo
 	/* fields set for ScalarArrayOpExpr arrays only */
 	Datum	   *elem_values;	/* array of num_elems Datums */
 	int			cur_elem;		/* index of current element in elem_values */
+	BTOrderArgLocation ord_arg_loc;	/* location of the ordering argument */
 
 	/* fields set for skip arrays only */
 	int16		attlen;			/* attr's length, in bytes */
@@ -1085,9 +1102,9 @@ typedef struct BTScanStateData
 	Datum		markDistance;	/* distance to the marked item */
 	bool		currIsNull;		/* current item is NULL */
 	bool		markIsNull;		/* marked item is NULL */
-} BTScanStateData;
+}			BTScanStateData;
 
-typedef BTScanStateData *BTScanState;
+typedef BTScanStateData * BTScanState;
 
 typedef struct BTScanOpaqueData
 {
@@ -1137,6 +1154,7 @@ typedef struct BTReadPageState
 	bool		firstpage;		/* page is first for primitive scan? */
 	bool		forcenonrequired;	/* treat all keys as nonrequired? */
 	int			startikey;		/* start comparisons from this scan key */
+	bool		ordarg_inside_array;
 
 	/* Per-tuple input parameters, set by _bt_readpage for _bt_checkkeys */
 	OffsetNumber offnum;		/* current tuple's page offset number */
@@ -1350,6 +1368,9 @@ extern int	_bt_binsrch_array_skey(FmgrInfo *orderproc,
 								   Datum tupdatum, bool tupnull,
 								   BTArrayKeyInfo *array, ScanKey cur,
 								   int32 *set_elem_result);
+extern int32 _bt_compare_array_skey(FmgrInfo *orderproc,
+									Datum tupdatum, bool tupnull,
+									Datum arrdatum, ScanKey cur);
 extern void _bt_start_array_keys(IndexScanDesc scan, ScanDirection dir);
 extern bool _bt_checkkeys(IndexScanDesc scan, BTScanState state,
 						  BTReadPageState *pstate, bool arrayKeys,
@@ -1357,6 +1378,7 @@ extern bool _bt_checkkeys(IndexScanDesc scan, BTScanState state,
 extern bool _bt_scanbehind_checkkeys(IndexScanDesc scan, ScanDirection dir,
 									 IndexTuple finaltup);
 extern void _bt_set_startikey(IndexScanDesc scan, BTReadPageState *pstate);
+extern void _bt_force_advance_array_keys(IndexScanDesc scan, BTReadPageState *pstate);
 extern void _bt_killitems(IndexScanDesc scan, BTScanState state);
 extern BTCycleId _bt_vacuum_cycleid(Relation rel);
 extern BTCycleId _bt_start_vacuum(Relation rel);
