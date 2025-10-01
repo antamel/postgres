@@ -949,10 +949,7 @@ _bt_alloc_knn_scan(IndexScanDesc scan)
 	lstate->numKilled = 0;
 	lstate->currDistance = (Datum) 0;
 	lstate->markDistance = (Datum) 0;
-	lstate->dropPin = (!scan->xs_want_itup &&
-					   IsMVCCSnapshot(scan->xs_snapshot) &&
-					   RelationNeedsWAL(scan->indexRelation) &&
-					   scan->heapRelation != NULL);
+	lstate->dropPin = so->state.dropPin;
 
 	return so->backwardState = lstate;
 }
@@ -1142,10 +1139,15 @@ _bt_first(IndexScanDesc scan, ScanDirection dir)
 
 		right = _bt_readnextpage(scan, &so->state, blkno, lastcurrblkno,
 								 knn ? ForwardScanDirection : dir, true);
-		if (!knn && right)
+		if (!knn)
 		{
-			_bt_returnitem(scan, &so->state);
-			return true;
+			if(right)
+			{
+				_bt_returnitem(scan, &so->state);
+				return true;
+			}
+			else
+				return false;
 		}
 
 		/* seize additional backward KNN scan */
@@ -1157,8 +1159,8 @@ _bt_first(IndexScanDesc scan, ScanDirection dir)
 			/* backward scan should be already initialized */
 			Assert(blkno != InvalidBlockNumber);
 			left = _bt_readnextpage(scan, so->backwardState, blkno,
-								   lastcurrblkno,
-								   BackwardScanDirection, true);
+									lastcurrblkno,
+									BackwardScanDirection, true);
 		}
 
 		return _bt_start_knn_scan(scan, left, right);
@@ -1888,7 +1890,7 @@ _bt_next(IndexScanDesc scan, ScanDirection dir)
 	BTScanOpaque so = (BTScanOpaque) scan->opaque;
 
 	Assert(BTScanPosIsValid(so->state.currPos) ||
-		(so->backwardState && BTScanPosIsValid(so->backwardState->currPos)));
+		   (so->backwardState && BTScanPosIsValid(so->backwardState->currPos)));
 
 	if (so->backwardState)
 		/* return next neareset item from KNN scan */
@@ -1988,13 +1990,35 @@ _bt_readpage(IndexScanDesc scan, BTScanState state, ScanDirection dir, OffsetNum
 	pstate.targetdistance = 0;
 	pstate.nskipadvances = 0;
 
+	pstate.ordarg_inside_array = false;
+
+	/*
+	 * Check if it is a type C scan. See the comment to the enum
+	 * BTOrderArgLocation
+	 */
+	for (int i = 0; i < so->numArrayKeys; i++)
+	{
+		BTArrayKeyInfo *array = &so->arrayKeys[i];
+
+		if (array->ord_arg_loc == WITHIN_ORDER_ARG_LOCATION)
+		{
+			pstate.ordarg_inside_array = true;
+			break;
+		}
+	}
+
 	if (ScanDirectionIsForward(dir))
 	{
 		/* SK_SEARCHARRAY forward scans must provide high key up front */
 		if (arrayKeys)
 		{
-			if (!P_RIGHTMOST(opaque))
+			if (!P_RIGHTMOST(opaque) || pstate.ordarg_inside_array)
 			{
+				/*
+				 * In the case C of distance ordering it must also be provided
+				 * for the final index page as forced primscan may occur
+				 * there.
+				 */
 				ItemId		iid = PageGetItemId(page, P_HIKEY);
 
 				pstate.finaltup = (IndexTuple) PageGetItem(page, iid);
@@ -2017,9 +2041,11 @@ _bt_readpage(IndexScanDesc scan, BTScanState state, ScanDirection dir, OffsetNum
 
 		/*
 		 * Consider pstate.startikey optimization once the ongoing primitive
-		 * index scan has already read at least one page
+		 * index scan has already read at least one page.
+		 * In WITHIN_ORDER_ARG_LOCATION case we need to consider every key
+		 * since any of them requires a new primscan and can not be skipped.
 		 */
-		if (!pstate.firstpage && minoff < maxoff)
+		if (!pstate.firstpage && minoff < maxoff &&	!pstate.ordarg_inside_array)
 			_bt_set_startikey(scan, &pstate);
 
 		/* load items[] in ascending order */
@@ -2131,6 +2157,17 @@ _bt_readpage(IndexScanDesc scan, BTScanState state, ScanDirection dir, OffsetNum
 			_bt_checkkeys(scan, state, &pstate, arrayKeys, itup, truncatt);
 		}
 
+		/*
+		 * Consider advancing the array keys in the C case of distance
+		 * ordering (see the comment to the enum BTOrderArgLocation). On
+		 * scanning forward, when the scan reaches the very last tuple, a
+		 * situation may arise where there may be some unpassed array elements
+		 * remaining, the first of which is in the opposite direction to the
+		 * scan just completed, so another primitive scan is required.
+		 */
+		if (pstate.ordarg_inside_array && pstate.continuescan && P_RIGHTMOST(opaque))
+			_bt_force_advance_array_keys(scan, &pstate);
+
 		if (!pstate.continuescan)
 			pos->moreRight = false;
 
@@ -2168,9 +2205,11 @@ _bt_readpage(IndexScanDesc scan, BTScanState state, ScanDirection dir, OffsetNum
 
 		/*
 		 * Consider pstate.startikey optimization once the ongoing primitive
-		 * index scan has already read at least one page
+		 * index scan has already read at least one page.
+		 * In WITHIN_ORDER_ARG_LOCATION case we need to consider every key
+		 * since any of them requires a new primscan and can not be skipped.
 		 */
-		if (!pstate.firstpage && minoff < maxoff)
+		if (!pstate.firstpage && minoff < maxoff &&	!pstate.ordarg_inside_array)
 			_bt_set_startikey(scan, &pstate);
 
 		/* load items[] in descending order */
@@ -2290,6 +2329,14 @@ _bt_readpage(IndexScanDesc scan, BTScanState state, ScanDirection dir, OffsetNum
 					}
 				}
 			}
+
+			/*
+			 * See the comment above for a similar case when scanning forward.
+			 * But for the very first tuple in the index.
+			 */
+			if (pstate.ordarg_inside_array && pstate.continuescan && P_LEFTMOST(opaque))
+				_bt_force_advance_array_keys(scan, &pstate);
+
 			/* When !continuescan, there can't be any more matches, so stop */
 			if (!pstate.continuescan)
 				break;
@@ -2554,8 +2601,8 @@ _bt_readfirstpage(IndexScanDesc scan, BTScanState state,
 	BTScanOpaque so = (BTScanOpaque) scan->opaque;
 	BTScanPos	currPos = &state->currPos;
 
-	state->numKilled = 0;			/* just paranoia */
-	state->markItemIndex = -1;		/* ditto */
+	state->numKilled = 0;		/* just paranoia */
+	state->markItemIndex = -1;	/* ditto */
 
 	/* Initialize so->currPos for the first page (page in so->currPos.buf) */
 	if (so->needPrimScan)
@@ -2584,8 +2631,8 @@ _bt_readfirstpage(IndexScanDesc scan, BTScanState state,
 	 * _bt_readpage also releases parallel scan (even when it returns false).
 	 */
 	if ((readPageStatus ?
-		*readPageStatus :
-		_bt_readpage(scan, state, dir, offnum, true)))
+		 *readPageStatus :
+		 _bt_readpage(scan, state, dir, offnum, true)))
 	{
 		Relation	rel = scan->indexRelation;
 
@@ -2676,11 +2723,11 @@ _bt_readnextpage(IndexScanDesc scan, BTScanState state, BlockNumber blkno,
 			/* most recent _bt_readpage call (for lastcurrblkno) ended scan */
 			Assert(currPos->currPage == lastcurrblkno && !seized);
 			BTScanPosInvalidate(*currPos);
-			_bt_parallel_done(scan, state);	/* iff !so->needPrimScan */
+			_bt_parallel_done(scan, state); /* iff !so->needPrimScan */
 			return false;
 		}
 
-		Assert(!((BTScanOpaque)scan->opaque)->needPrimScan);
+		Assert(!((BTScanOpaque) scan->opaque)->needPrimScan);
 
 		/* parallel scan must never actually visit so->currPos blkno */
 		if (!seized && scan->parallel_scan != NULL &&
@@ -2701,7 +2748,7 @@ _bt_readnextpage(IndexScanDesc scan, BTScanState state, BlockNumber blkno,
 		{
 			/* read blkno, avoiding race (also checks for interrupts) */
 			currPos->buf = _bt_lock_and_validate_left(rel, &blkno,
-														 lastcurrblkno);
+													  lastcurrblkno);
 			if (currPos->buf == InvalidBuffer)
 			{
 				/* must have been a concurrent deletion of leftmost page */
@@ -2711,8 +2758,8 @@ _bt_readnextpage(IndexScanDesc scan, BTScanState state, BlockNumber blkno,
 			}
 			if (blkno == P_NONE)
 			{
-				_bt_parallel_done(scan, state);
 				BTScanPosInvalidate(*currPos);
+				_bt_parallel_done(scan, state);
 				return false;
 			}
 		}
