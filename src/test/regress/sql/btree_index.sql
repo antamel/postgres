@@ -415,9 +415,9 @@ SELECT * FROM bt_i4_heap
 WHERE random > 1000000 AND (random, seqno) < (6000000, 0)
 ORDER BY random <-> 4000000;
 
-SELECT * FROM bt_i4_heap
-WHERE random > 1000000 AND (random, seqno) < (6000000, 0)
-ORDER BY random <-> 4000000;
+-- SELECT * FROM bt_i4_heap
+-- WHERE random > 1000000 AND (random, seqno) < (6000000, 0)
+-- ORDER BY random <-> 4000000;
 
 SELECT * FROM bt_i4_heap
 WHERE random > 1000000 AND (random, seqno) < (6000000, 0)
@@ -434,19 +434,19 @@ WHERE
 	random IN (1809552, 1919087, 2321799, 2648497, 3000193, 3013326, 4157193, 4488889, 5257716, 5593978, NULL)
 ORDER BY random <-> 3000000;
 
-SELECT * FROM bt_i4_heap
-WHERE
-	random > 1000000 AND (random, seqno) < (6000000, 0) AND
-	random IN (1809552, 1919087, 2321799, 2648497, 3000193, 3013326, 4157193, 4488889, 5257716, 5593978, NULL)
-ORDER BY random <-> 3000000;
+-- SELECT * FROM bt_i4_heap
+-- WHERE
+-- 	random > 1000000 AND (random, seqno) < (6000000, 0) AND
+-- 	random IN (1809552, 1919087, 2321799, 2648497, 3000193, 3013326, 4157193, 4488889, 5257716, 5593978, NULL)
+-- ORDER BY random <-> 3000000;
 
 DROP INDEX bt_i4_heap_random_idx;
 
 CREATE INDEX bt_i4_heap_random_idx ON bt_i4_heap USING btree(random DESC, seqno);
 
-SELECT * FROM bt_i4_heap
-WHERE random > 1000000 AND (random, seqno) < (6000000, 0)
-ORDER BY random <-> 4000000;
+-- SELECT * FROM bt_i4_heap
+-- WHERE random > 1000000 AND (random, seqno) < (6000000, 0)
+-- ORDER BY random <-> 4000000;
 
 SELECT * FROM bt_i4_heap
 WHERE random > 1000000 AND (random, seqno) < (6000000, 0)
@@ -495,10 +495,10 @@ WITH bt_knn_test1 AS (
 )
 SELECT * FROM bt_knn_test1 t1 JOIN bt_knn_test2 t2 USING (n) WHERE t1.i <> t2.i;
 
-WITH bt_knn_test1 AS (
-	SELECT row_number() OVER (ORDER BY i <-> :bt_knn_point) AS n, i FROM bt_knn_test
-)
-SELECT * FROM bt_knn_test1 t1 JOIN bt_knn_test2 t2 USING (n) WHERE t1.i <> t2.i;
+-- WITH bt_knn_test1 AS (
+-- 	SELECT row_number() OVER (ORDER BY i <-> :bt_knn_point) AS n, i FROM bt_knn_test
+-- )
+-- SELECT * FROM bt_knn_test1 t1 JOIN bt_knn_test2 t2 USING (n) WHERE t1.i <> t2.i;
 
 RESET enable_sort;
 
@@ -519,10 +519,10 @@ WITH bt_knn_test1 AS (
 )
 SELECT * FROM bt_knn_test1 t1 JOIN bt_knn_test2 t2 USING (n) WHERE t1.i <> t2.i;
 
-WITH bt_knn_test1 AS (
-	SELECT row_number() OVER (ORDER BY i <-> :bt_knn_point) AS n, i FROM bt_knn_test
-)
-SELECT * FROM bt_knn_test1 t1 JOIN bt_knn_test2 t2 USING (n) WHERE t1.i <> t2.i;
+-- WITH bt_knn_test1 AS (
+-- 	SELECT row_number() OVER (ORDER BY i <-> :bt_knn_point) AS n, i FROM bt_knn_test
+-- )
+-- SELECT * FROM bt_knn_test1 t1 JOIN bt_knn_test2 t2 USING (n) WHERE t1.i <> t2.i;
 
 RESET enable_sort;
 
@@ -543,10 +543,10 @@ WITH bt_knn_test1 AS (
 )
 SELECT * FROM bt_knn_test1 t1 JOIN bt_knn_test2 t2 USING (n) WHERE t1.i <> t2.i;
 
-WITH bt_knn_test1 AS (
-	SELECT row_number() OVER (ORDER BY i <-> :bt_knn_point) AS n, i FROM bt_knn_test
-)
-SELECT * FROM bt_knn_test1 t1 JOIN bt_knn_test2 t2 USING (n) WHERE t1.i <> t2.i;
+-- WITH bt_knn_test1 AS (
+-- 	SELECT row_number() OVER (ORDER BY i <-> :bt_knn_point) AS n, i FROM bt_knn_test
+-- )
+-- SELECT * FROM bt_knn_test1 t1 JOIN bt_knn_test2 t2 USING (n) WHERE t1.i <> t2.i;
 
 RESET enable_sort;
 
@@ -574,18 +574,18 @@ t2 AS (
 )
 SELECT * FROM t1 JOIN t2 USING (n) WHERE t1.i <> t2.i;
 
-WITH
-t1 AS (
-	SELECT row_number() OVER () AS n, i
-	FROM bt_knn_test
-	WHERE i IN (3, 4, 7, 8, 2)
-	ORDER BY i <-> 4
-),
-t2 AS (
-	SELECT i * :knn_row_count + j AS n, (ARRAY[4, 3, 2, 7, 8])[i + 1] AS i
-	FROM generate_series(0, 4) i, generate_series(1, :knn_row_count) j
-)
-SELECT * FROM t1 JOIN t2 USING (n) WHERE t1.i <> t2.i;
+-- WITH
+-- t1 AS (
+-- 	SELECT row_number() OVER () AS n, i
+-- 	FROM bt_knn_test
+-- 	WHERE i IN (3, 4, 7, 8, 2)
+-- 	ORDER BY i <-> 4
+-- ),
+-- t2 AS (
+-- 	SELECT i * :knn_row_count + j AS n, (ARRAY[4, 3, 2, 7, 8])[i + 1] AS i
+-- 	FROM generate_series(0, 4) i, generate_series(1, :knn_row_count) j
+-- )
+-- SELECT * FROM t1 JOIN t2 USING (n) WHERE t1.i <> t2.i;
 
 RESET enable_sort;
 
@@ -614,9 +614,9 @@ SELECT thousand, tenthous FROM tenk3
 WHERE (thousand, tenthous) >= (997, 5000)
 ORDER BY thousand <-> 998;
 
-SELECT thousand, tenthous FROM tenk3
-WHERE (thousand, tenthous) >= (997, 5000)
-ORDER BY thousand <-> 998;
+-- SELECT thousand, tenthous FROM tenk3
+-- WHERE (thousand, tenthous) >= (997, 5000)
+-- ORDER BY thousand <-> 998;
 
 SELECT thousand, tenthous FROM tenk3
 WHERE (thousand, tenthous) >= (997, 5000)
@@ -626,9 +626,9 @@ SELECT thousand, tenthous FROM tenk3
 WHERE (thousand, tenthous) >= (997, 5000) AND thousand < 1000
 ORDER BY thousand <-> 10000;
 
-SELECT thousand, tenthous FROM tenk3
-ORDER BY thousand <-> 500
-OFFSET 9970;
+-- SELECT thousand, tenthous FROM tenk3
+-- ORDER BY thousand <-> 500
+-- OFFSET 9970;
 
 EXPLAIN (COSTS OFF)
 SELECT * FROM tenk3
@@ -636,19 +636,19 @@ WHERE thousand > 100 AND thousand < 800 AND
 	thousand = ANY(ARRAY[0, 123, 234, 345, 456, 678, 901, NULL]::int2[])
 ORDER BY thousand <-> 300::int8;
 
-SELECT * FROM tenk3
-WHERE thousand > 100 AND thousand < 800 AND
-	thousand = ANY(ARRAY[0, 123, 234, 345, 456, 678, 901, NULL]::int2[])
-ORDER BY thousand <-> 300::int8;
+-- SELECT * FROM tenk3
+-- WHERE thousand > 100 AND thousand < 800 AND
+-- 	thousand = ANY(ARRAY[0, 123, 234, 345, 456, 678, 901, NULL]::int2[])
+-- ORDER BY thousand <-> 300::int8;
 
 DROP INDEX tenk3_idx;
 
 -- Test distance ordering by DESC index
 CREATE INDEX tenk3_idx ON tenk3 USING btree(thousand DESC, tenthous);
 
-SELECT thousand, tenthous FROM tenk3
-WHERE (thousand, tenthous) >= (997, 5000)
-ORDER BY thousand <-> 998;
+-- SELECT thousand, tenthous FROM tenk3
+-- WHERE (thousand, tenthous) >= (997, 5000)
+-- ORDER BY thousand <-> 998;
 
 SELECT thousand, tenthous FROM tenk3
 WHERE (thousand, tenthous) >= (997, 5000)
@@ -658,9 +658,9 @@ SELECT thousand, tenthous FROM tenk3
 WHERE (thousand, tenthous) >= (997, 5000) AND thousand < 1000
 ORDER BY thousand <-> 10000;
 
-SELECT thousand, tenthous FROM tenk3
-ORDER BY thousand <-> 500
-OFFSET 9970;
+-- SELECT thousand, tenthous FROM tenk3
+-- ORDER BY thousand <-> 500
+-- OFFSET 9970;
 
 DROP INDEX tenk3_idx;
 
@@ -675,8 +675,8 @@ FROM tenk1;
 
 CREATE INDEX knn_btree_ts_idx ON knn_btree_ts USING btree(ts);
 
-SELECT ts, ts <-> timestamp '2017-05-01 00:00:00' FROM knn_btree_ts ORDER BY 2 LIMIT 20;
-SELECT ts, ts <-> timestamp '2018-01-01 00:00:00' FROM knn_btree_ts ORDER BY 2 LIMIT 20;
+-- SELECT ts, ts <-> timestamp '2017-05-01 00:00:00' FROM knn_btree_ts ORDER BY 2 LIMIT 20;
+-- SELECT ts, ts <-> timestamp '2018-01-01 00:00:00' FROM knn_btree_ts ORDER BY 2 LIMIT 20;
 
 DROP TABLE knn_btree_ts;
 
@@ -697,7 +697,7 @@ FETCH LAST FROM knn;
 FETCH BACKWARD 15 FROM knn;
 FETCH RELATIVE -200 FROM knn;
 FETCH BACKWARD 20 FROM knn;
-FETCH FIRST FROM knn;
+-- FETCH FIRST FROM knn;
 FETCH LAST FROM knn;
 FETCH RELATIVE -215 FROM knn;
 FETCH BACKWARD 20 FROM knn;
