@@ -1037,7 +1037,7 @@ typedef BTScanPosData *BTScanPos;
  * case A: ordering argument is less or equal to the minarray element;
  * case B: ordering argument is greater or equal to the max element;
  * case C: ordering argument is within the array bounds.
- * This enum defines these three cases.
+ * The enum below defines these three cases.
  */
 
 typedef enum BTOrderArgLocation
